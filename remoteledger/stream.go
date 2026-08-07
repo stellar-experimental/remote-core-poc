@@ -87,6 +87,12 @@ func (s *Stream) readLimit() int64 {
 	if s.maxPayloadSize < 0 {
 		return -1 // coder/websocket's "unlimited"
 	}
+	// Saturate rather than wrap: a cap near math.MaxInt64 plus the header would
+	// overflow to a negative limit, which is how the library spells "no limit at
+	// all" — turning an enormous cap into no cap.
+	if s.maxPayloadSize > math.MaxInt64-wire.HeaderSize {
+		return math.MaxInt64
+	}
 	return s.maxPayloadSize + wire.HeaderSize
 }
 

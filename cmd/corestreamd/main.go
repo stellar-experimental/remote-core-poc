@@ -37,6 +37,7 @@ import (
 
 	"github.com/stellar/remote-core-poc/internal/server"
 	"github.com/stellar/remote-core-poc/internal/store"
+	"github.com/stellar/remote-core-poc/internal/wire"
 )
 
 func main() {
@@ -104,6 +105,21 @@ func parseFlags(out io.Writer, args []string) (options, error) {
 	if uint64(o.syntheticCount) > math.MaxUint32 {
 		return o, fmt.Errorf("--synthetic-count %d is too large", o.syntheticCount)
 	}
+	// The protocol has no sequence wrap, so the last representable ledger is not
+	// streamable. Refusing a range that reaches it here keeps the retention ring
+	// from ever holding a ledger no subscriber could ask to continue from.
+	if last := lastSequence(o); last >= math.MaxUint32 {
+		return o, fmt.Errorf(
+			"the requested range reaches ledger %d, the last representable sequence, which is not streamable; "+
+				"lower --start-ledger or --synthetic-count", uint32(math.MaxUint32))
+	}
+	// 256 MiB is the protocol's payload cap, matching the SDK's captive-core frame
+	// cap. It is not operator-tunable, so an oversized synthetic ledger is a flag
+	// error rather than a knob.
+	if int64(o.syntheticSize) > wire.DefaultMaxPayloadSize {
+		return o, fmt.Errorf("--synthetic-size %d exceeds the %d-byte protocol payload cap",
+			o.syntheticSize, wire.DefaultMaxPayloadSize)
+	}
 	if o.source == "captive" {
 		if o.startLedger == 0 {
 			// Resolving "tip" needs a history archive round-trip this prototype
@@ -118,6 +134,25 @@ func parseFlags(out io.Writer, args []string) (options, error) {
 		}
 	}
 	return o, nil
+}
+
+// lastSequence is the highest ledger the configured range is known to reach,
+// computed in uint64 so the arithmetic itself cannot wrap.
+//
+// An endless synthetic source and a captive source are both unbounded, so their
+// highest sequence is unknown here and only the start is reported. Such a run
+// would have to stream billions of ledgers to reach the ceiling, and if it ever
+// did, the retention ring refuses the wrapped sequence and the source loop fails
+// loudly rather than serving nonsense.
+func lastSequence(o options) uint64 {
+	start := uint64(o.startLedger)
+	if start == 0 {
+		start = 1
+	}
+	if o.source == "synthetic" && o.syntheticCount > 0 {
+		return start + uint64(o.syntheticCount) - 1
+	}
+	return start
 }
 
 func run() error {

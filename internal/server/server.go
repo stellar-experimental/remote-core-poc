@@ -36,6 +36,11 @@ const DefaultPingInterval = 15 * time.Second
 // without a reset would otherwise leave a handler blocked in write forever.
 const writeTimeout = 2 * time.Minute
 
+// maxPayloadSize is the largest ledger the protocol can carry. It is a variable
+// only so tests can shrink it; the cap itself is protocol-defined, not an
+// operator setting, which is why no flag exposes it.
+var maxPayloadSize = wire.DefaultMaxPayloadSize
+
 // Config describes a server.
 type Config struct {
 	// Source supplies ledgers. It is consumed exactly once, by Run.
@@ -142,6 +147,17 @@ func (s *Server) Run(ctx context.Context) error {
 				return nil
 			}
 			return fmt.Errorf("source failed at ledger %d: %w", seq, err)
+		}
+
+		// A ledger no subscriber could read is a failure here, not something to
+		// hand out: every client's read limit is the protocol cap, so publishing
+		// past it would disconnect all of them with a framing error instead of
+		// telling the operator what is wrong. The SDK caps captive-core frames at
+		// 256 MiB, so this fires only on a misconfigured synthetic source or a
+		// future source with a larger frame.
+		if int64(len(raw)) > maxPayloadSize {
+			return fmt.Errorf("ledger %d is %d bytes, over the %d-byte protocol payload cap",
+				seq, len(raw), maxPayloadSize)
 		}
 
 		// One allocation holds the header and our copy of the borrowed slice; the
@@ -393,7 +409,10 @@ func (s *Server) replay(
 		through = req.end
 	}
 	buf := make([]byte, 0, wire.HeaderSize+64<<10)
-	for seq := req.start; seq <= through; seq++ {
+	// Breaking after the last sequence instead of testing seq <= through keeps the
+	// loop finite when through is math.MaxUint32, where seq++ would wrap to 0 and
+	// the comparison would never end it.
+	for seq := req.start; ; seq++ {
 		raw, err := s.store.Get(seq)
 		if err != nil {
 			if errors.Is(err, store.ErrNotRetained) {
@@ -411,6 +430,9 @@ func (s *Server) replay(
 			return closeOutcome{}, err
 		}
 		*next = seq + 1
+		if seq == through {
+			break
+		}
 	}
 	if req.bounded && *next > req.end {
 		return closeOutcome{true, websocket.StatusNormalClosure, ""}, nil

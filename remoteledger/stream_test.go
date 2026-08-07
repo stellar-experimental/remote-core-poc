@@ -564,6 +564,32 @@ func TestReadLimitAdmitsTheLargestPayload(t *testing.T) {
 	}
 }
 
+func TestReadLimitSaturatesInsteadOfOverflowing(t *testing.T) {
+	// Adding the header to a cap near the int64 ceiling would wrap to a negative
+	// number, which is how the library spells "no limit at all" — the one thing an
+	// enormous cap must not turn into.
+	tests := []struct {
+		name string
+		cap  int64
+		want int64
+	}{
+		{"the int64 ceiling", math.MaxInt64, math.MaxInt64},
+		{"one header short of it", math.MaxInt64 - wire.HeaderSize, math.MaxInt64},
+		{"two headers short of it", math.MaxInt64 - wire.HeaderSize - 1, math.MaxInt64 - 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := New("ws://box", WithMaxMessageSize(tt.cap)).readLimit()
+			if got != tt.want {
+				t.Errorf("read limit for a cap of %d = %d, want %d", tt.cap, got, tt.want)
+			}
+			if got < 0 {
+				t.Errorf("read limit for a cap of %d is negative, which disables the cap", tt.cap)
+			}
+		})
+	}
+}
+
 func TestRawLedgersPayloadAtTheLimit(t *testing.T) {
 	const limit = 64 << 10
 	tests := []struct {

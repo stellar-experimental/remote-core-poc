@@ -57,6 +57,8 @@ A bounded range that ends short surfaces as `remoteledger.ErrTruncated`, naming 
 
 The server pings every 15 s. The client accepts a ledger payload of up to 256 MiB, matching the SDK's captive-core frame cap; its WebSocket read limit is that plus the 14-byte header, so the largest ledger is not rejected by its own framing. `remoteledger.WithMaxMessageSize` moves that payload cap.
 
+That 256 MiB is the protocol's ceiling, not a setting: `corestreamd` refuses a `--synthetic-size` above it, and its source loop fails with a clear error rather than publishing a ledger no subscriber's read limit would admit. The last representable ledger sequence (`4294967295`) is likewise not streamable — the protocol has no wrap — so both ends refuse a range that reaches it.
+
 ## Run the synthetic demo (no core binary, no network)
 
 The quickest look at the whole path is one command — server, client and measurement in a single process:

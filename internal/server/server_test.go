@@ -5,6 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -206,6 +209,66 @@ func TestUnboundedSubscriptionEndsCleanlyWhenSourceEnds(t *testing.T) {
 		t.Fatalf("stream error: %v", c.err)
 	}
 	wantContiguous(t, c.seqs, 1, 5)
+}
+
+func TestReplayTerminatesAtTheSequenceCeiling(t *testing.T) {
+	// The retained window ends at math.MaxUint32, where incrementing the replay
+	// cursor wraps to 0. A cursor that wraps asks the store for ledger 0, which is
+	// not retained — so the subscriber would be told it is too far behind right
+	// after being served the whole window it asked for.
+	const first = uint32(math.MaxUint32 - 2)
+	h := startHarness(t, harnessOpts{start: first, count: 3})
+	if err := h.wait(t); err != nil {
+		t.Fatalf("source loop: %v", err)
+	}
+	if _, latest, _ := h.store.Bounds(); latest != math.MaxUint32 {
+		t.Fatalf("retained latest = %d, want the ceiling %d", latest, uint32(math.MaxUint32))
+	}
+
+	// Unbounded, and read to the end of the stream: the replay cursor runs to the
+	// ceiling instead of stopping at a requested end, and the subscription then
+	// finishes on the source ending, with no error.
+	c := consume(t.Context(), t, h.url, ledgerbackend.UnboundedRange(first), 0, nil)
+	if c.err != nil {
+		t.Fatalf("stream error after replaying through the ceiling: %v", c.err)
+	}
+	wantContiguous(t, c.seqs, first, math.MaxUint32)
+}
+
+func TestSourceLoopRejectsAnOversizedLedger(t *testing.T) {
+	// No subscriber could read a ledger past the protocol cap — every client's
+	// read limit is that cap — so the source loop must fail loudly instead of
+	// publishing it.
+	original := maxPayloadSize
+	maxPayloadSize = 128
+	t.Cleanup(func() { maxPayloadSize = original })
+
+	ring, err := store.Open(t.TempDir(), 10)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	srv, err := New(Config{
+		Source: NewSyntheticStream(SyntheticConfig{Size: 4096}),
+		Range:  ledgerbackend.BoundedRange(1, 3),
+		Store:  ring,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	err = srv.Run(t.Context())
+	if err == nil {
+		t.Fatal("the source loop published a ledger over the payload cap")
+	}
+	for _, want := range []string{"ledger 1", "4096", "128"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %v does not mention %q", err, want)
+		}
+	}
+	if _, _, filled := ring.Bounds(); filled {
+		t.Error("the oversized ledger was retained anyway")
+	}
 }
 
 func TestReplayLosingALedgerToPruningIsTooFarBehind(t *testing.T) {
