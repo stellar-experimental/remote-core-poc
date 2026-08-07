@@ -1,0 +1,5 @@
+# Default retention/storage directory of a corestreamd run from the repo root.
+corestreamd-data/
+
+# Benchmark output.
+*.csv
