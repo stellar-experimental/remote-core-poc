@@ -68,8 +68,10 @@ func TestRunLoopback(t *testing.T) {
 			t.Errorf("ledger %d arrived with %d bytes, want 4096", s.seq, s.bytes)
 		}
 	}
-	if len(c.deliveries()) == 0 {
-		t.Error("no ledger carried an emit stamp, so no latency was measured")
+	// The consumer subscribes before the source starts, so every ledger is
+	// delivered live and none drops out of the latency measurement.
+	if got, want := len(c.deliveries()), len(c.samples); got != want {
+		t.Errorf("%d of %d ledgers carried an emit stamp; loopback must deliver them all live", got, want)
 	}
 
 	summary := c.summary()

@@ -13,13 +13,16 @@ func TestPercentile(t *testing.T) {
 		5 * time.Millisecond, 6 * time.Millisecond, 7 * time.Millisecond, 8 * time.Millisecond,
 		9 * time.Millisecond, 10 * time.Millisecond,
 	}
+	// Nearest rank over ten values: p50 is the 5th, p90 the 9th, p99 the 10th.
 	tests := []struct {
 		p    int
 		want time.Duration
 	}{
 		{0, 1 * time.Millisecond},
-		{50, 6 * time.Millisecond},
-		{90, 10 * time.Millisecond},
+		{10, 1 * time.Millisecond},
+		{50, 5 * time.Millisecond},
+		{90, 9 * time.Millisecond},
+		{95, 10 * time.Millisecond},
 		{99, 10 * time.Millisecond},
 		{100, 10 * time.Millisecond},
 	}

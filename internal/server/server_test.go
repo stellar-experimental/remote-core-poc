@@ -389,7 +389,12 @@ func TestHealthz(t *testing.T) {
 
 func TestStreamRejectsBadQuery(t *testing.T) {
 	h := startHarness(t, harnessOpts{count: 1})
-	for _, query := range []string{"?start=abc", "?end=xyz", "?start=9&end=4", "?end=0"} {
+	for _, query := range []string{
+		"?start=abc", "?end=xyz", "?start=9&end=4", "?end=0",
+		// The protocol has no sequence wrap, so the last representable ledger is
+		// not streamable from either parameter.
+		"?start=4294967295", "?end=4294967295", "?start=4294967295&end=4294967295",
+	} {
 		resp, err := http.Get(h.url + "/v1/stream" + query)
 		if err != nil {
 			t.Fatalf("GET %s: %v", query, err)
@@ -418,6 +423,8 @@ func TestParseStreamRequest(t *testing.T) {
 		{"zero end", map[string][]string{"end": {"0"}}, streamRequest{}, true},
 		{"unparseable start", map[string][]string{"start": {"x"}}, streamRequest{}, true},
 		{"start too large", map[string][]string{"start": {"4294967296"}}, streamRequest{}, true},
+		{"start at the ceiling", map[string][]string{"start": {"4294967295"}}, streamRequest{}, true},
+		{"end at the ceiling", map[string][]string{"start": {"1"}, "end": {"4294967295"}}, streamRequest{}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -72,11 +73,21 @@ func (e *TooFarBehindError) Unwrap() error { return ErrTooFarBehind }
 // connection of its own: each RawLedgers call dials, streams, and tears the
 // connection down, so a Stream is reusable and safe to keep in a config.
 type Stream struct {
-	rawURL         string
+	rawURL string
+	// maxPayloadSize caps the ledger bytes accepted; the read limit adds the
+	// protocol header on top. Negative means no cap.
+	maxPayloadSize int64
 	httpClient     *http.Client
-	maxMessageSize int64
 	dialTimeout    time.Duration
 	observe        func(LedgerInfo)
+}
+
+// readLimit is the whole-message ceiling for the configured payload cap.
+func (s *Stream) readLimit() int64 {
+	if s.maxPayloadSize < 0 {
+		return -1 // coder/websocket's "unlimited"
+	}
+	return s.maxPayloadSize + wire.HeaderSize
 }
 
 // LedgerInfo is the delivery metadata of one received ledger. It exists because
@@ -124,10 +135,12 @@ func WithHTTPClient(client *http.Client) Option {
 	return func(s *Stream) { s.httpClient = client }
 }
 
-// WithMaxMessageSize caps the ledger message the client will accept. The default
-// matches the SDK's captive-core frame cap, 256 MiB. Negative disables the cap.
+// WithMaxMessageSize caps the ledger PAYLOAD the client will accept, in bytes;
+// the protocol header is admitted on top of it, so a limit of n accepts a ledger
+// of exactly n bytes. The default is wire.DefaultMaxPayloadSize, 256 MiB, which
+// matches the SDK's captive-core frame cap. Negative disables the cap.
 func WithMaxMessageSize(n int64) Option {
-	return func(s *Stream) { s.maxMessageSize = n }
+	return func(s *Stream) { s.maxPayloadSize = n }
 }
 
 // WithDialTimeout bounds the handshake. Zero or negative means no timeout beyond
@@ -151,7 +164,7 @@ func WithObserver(fn func(LedgerInfo)) Option {
 func New(rawURL string, opts ...Option) *Stream {
 	s := &Stream{
 		rawURL:         rawURL,
-		maxMessageSize: wire.DefaultMaxMessageSize,
+		maxPayloadSize: wire.DefaultMaxPayloadSize,
 		dialTimeout:    DefaultDialTimeout,
 	}
 	for _, opt := range opts {
@@ -199,11 +212,16 @@ func (s *Stream) RawLedgers(
 		// CloseNow is the teardown for every exit path; a graceful close on
 		// normal completion runs before it and makes it a no-op.
 		defer func() { _ = conn.CloseNow() }()
-		conn.SetReadLimit(s.maxMessageSize)
+		conn.SetReadLimit(s.readLimit())
 
 		// One buffer, reused: this is what makes the yielded slice a borrow.
 		var buf bytes.Buffer
 		expected := ledgerRange.From()
+		// Set once the last representable sequence has been delivered. Nothing can
+		// follow it: expected wraps to 0 there, which is the value that means
+		// "accept any first ledger", so without this flag a wrap would silently
+		// re-open the stream to any sequence at all.
+		var exhausted bool
 
 		for {
 			typ, reader, err := conn.Reader(ctx)
@@ -245,10 +263,16 @@ func (s *Stream) RawLedgers(
 			// The server promises in-order, gapless delivery within a
 			// subscription. A tip subscription (from 0) accepts whatever ledger
 			// arrives first and holds the server to continuity from there.
+			if exhausted {
+				yield(nil, fmt.Errorf("%w: ledger %d cannot follow %d, the last representable sequence",
+					ErrGap, header.Sequence, uint32(math.MaxUint32)))
+				return
+			}
 			if expected != 0 && header.Sequence != expected {
 				yield(nil, fmt.Errorf("%w: got ledger %d, expected %d", ErrGap, header.Sequence, expected))
 				return
 			}
+			exhausted = header.Sequence == math.MaxUint32
 			expected = header.Sequence + 1
 
 			if s.observe != nil {
@@ -334,7 +358,19 @@ func (s *Stream) endpoint(ledgerRange ledgerbackend.Range) (string, error) {
 		u.Path = wire.StreamPath
 	}
 
+	// Sequences are uint32 and the protocol has no wrap: the last representable
+	// ledger has no successor to ask for next, so the edge is refused here rather
+	// than producing a subscription that cannot continue.
+	if ledgerRange.From() == math.MaxUint32 || (ledgerRange.Bounded() && ledgerRange.To() == math.MaxUint32) {
+		return "", fmt.Errorf("remoteledger: range %s reaches ledger %d, the last representable sequence",
+			ledgerRange, uint32(math.MaxUint32))
+	}
+
 	q := u.Query()
+	// The range owns these two parameters. Anything the configured URL carried is
+	// stale and would contradict what this call asked for.
+	q.Del("start")
+	q.Del("end")
 	q.Set("start", strconv.FormatUint(uint64(ledgerRange.From()), 10))
 	if ledgerRange.Bounded() {
 		if ledgerRange.To() < ledgerRange.From() {

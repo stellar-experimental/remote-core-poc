@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -468,6 +469,128 @@ func TestDialFailures(t *testing.T) {
 			r := drain(t.Context(), New(tt.url, WithDialTimeout(2*time.Second)), ledgerbackend.UnboundedRange(1))
 			if r.err == nil {
 				t.Fatalf("New(%q) streamed successfully, want a dial error", tt.url)
+			}
+		})
+	}
+}
+
+func TestEndpointScrubsStaleRangeParams(t *testing.T) {
+	// The range owns start and end. A URL configured with either must not leak
+	// into a call that asked for something else; unrelated parameters survive.
+	stream := New("ws://box:8462/v1/stream?start=9&end=5&token=abc")
+
+	got, err := stream.endpoint(ledgerbackend.UnboundedRange(10))
+	if err != nil {
+		t.Fatalf("endpoint: %v", err)
+	}
+	if want := "ws://box:8462/v1/stream?start=10&token=abc"; got != want {
+		t.Errorf("endpoint = %q, want %q", got, want)
+	}
+
+	got, err = stream.endpoint(ledgerbackend.BoundedRange(2, 3))
+	if err != nil {
+		t.Fatalf("endpoint: %v", err)
+	}
+	if want := "ws://box:8462/v1/stream?end=3&start=2&token=abc"; got != want {
+		t.Errorf("endpoint = %q, want %q", got, want)
+	}
+}
+
+func TestEndpointRejects(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+		rng  ledgerbackend.Range
+	}{
+		{"bad scheme", "ftp://box", ledgerbackend.UnboundedRange(1)},
+		{"no host", "ws://", ledgerbackend.UnboundedRange(1)},
+		{"unparseable", "ws://[::1", ledgerbackend.UnboundedRange(1)},
+		// Sequences are uint32 with no wrap: the last representable ledger has no
+		// successor to ask for, so the edge is refused rather than half-served.
+		{"start at the ceiling", "ws://box", ledgerbackend.UnboundedRange(math.MaxUint32)},
+		{"end at the ceiling", "ws://box", ledgerbackend.BoundedRange(5, math.MaxUint32)},
+		{"single ledger at the ceiling", "ws://box", ledgerbackend.SingleLedgerRange(math.MaxUint32)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got, err := New(tt.url).endpoint(tt.rng); err == nil {
+				t.Errorf("endpoint = %q, want an error", got)
+			}
+		})
+	}
+}
+
+func TestRawLedgersRejectsCeilingRangeBeforeDialing(t *testing.T) {
+	// Nothing is listening: the range must be refused before any connection.
+	r := drain(t.Context(), New("ws://127.0.0.1:1"), ledgerbackend.BoundedRange(5, math.MaxUint32))
+	if r.err == nil {
+		t.Fatal("a range reaching the sequence ceiling was accepted")
+	}
+	if strings.Contains(r.err.Error(), "dial") {
+		t.Errorf("error = %v, want the range refused before dialling", r.err)
+	}
+}
+
+func TestRawLedgersRejectsSequenceWrap(t *testing.T) {
+	// A tip subscription accepts any first ledger, including the ceiling. What it
+	// must not accept is a ledger after it: expected wraps to 0 there, the value
+	// that means "any first ledger", so a wrap would re-open the stream.
+	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
+		sendLedgers(t, conn, ctx, 32, math.MaxUint32, 1)
+	})
+	r := drain(t.Context(), New(url), ledgerbackend.UnboundedRange(0))
+	if !errors.Is(r.err, ErrGap) {
+		t.Fatalf("error = %v, want ErrGap", r.err)
+	}
+	if r.count != 1 {
+		t.Errorf("received %d ledgers, want the 1 before the wrap", r.count)
+	}
+	if !strings.Contains(r.err.Error(), "last representable") {
+		t.Errorf("error %v does not explain the wrap", r.err)
+	}
+}
+
+func TestReadLimitAdmitsTheLargestPayload(t *testing.T) {
+	// The read limit is a whole-message ceiling, so capping it at the payload size
+	// would reject the largest ledger by exactly the header.
+	if got, want := New("ws://box").readLimit(), wire.DefaultMaxPayloadSize+wire.HeaderSize; got != want {
+		t.Errorf("default read limit = %d, want %d (256 MiB payload plus header)", got, want)
+	}
+	if got := New("ws://box", WithMaxMessageSize(4096)).readLimit(); got != 4096+wire.HeaderSize {
+		t.Errorf("read limit for a 4096-byte cap = %d, want %d", got, 4096+wire.HeaderSize)
+	}
+	if got := New("ws://box", WithMaxMessageSize(-1)).readLimit(); got != -1 {
+		t.Errorf("read limit for a negative cap = %d, want -1 (no limit)", got)
+	}
+}
+
+func TestRawLedgersPayloadAtTheLimit(t *testing.T) {
+	const limit = 64 << 10
+	tests := []struct {
+		name    string
+		size    int
+		wantErr bool
+	}{
+		{"exactly at the limit", limit, false},
+		{"one byte over", limit + 1, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
+				sendLedgers(t, conn, ctx, tt.size, 1)
+			})
+			r := drain(t.Context(), New(url, WithMaxMessageSize(limit)), ledgerbackend.SingleLedgerRange(1))
+			if tt.wantErr {
+				if r.err == nil {
+					t.Fatalf("a %d-byte payload passed a %d-byte cap", tt.size, limit)
+				}
+				return
+			}
+			if r.err != nil {
+				t.Fatalf("a %d-byte payload was rejected by a %d-byte cap: %v", tt.size, limit, r.err)
+			}
+			if r.count != 1 || r.sizes[0] != tt.size {
+				t.Errorf("received %d ledgers with sizes %v, want one of %d", r.count, r.sizes, tt.size)
 			}
 		})
 	}

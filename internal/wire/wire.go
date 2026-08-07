@@ -27,9 +27,15 @@ const (
 	// HeaderSize is the fixed byte count in front of every payload.
 	HeaderSize = 14
 
-	// DefaultMaxMessageSize matches the SDK captive-core frame cap (256 MiB),
-	// so any ledger core can emit fits in one message.
-	DefaultMaxMessageSize int64 = 256 << 20
+	// DefaultMaxPayloadSize matches the SDK captive-core frame cap (256 MiB), so
+	// any ledger core can emit fits in one message.
+	DefaultMaxPayloadSize int64 = 256 << 20
+
+	// DefaultMaxMessageSize is what a reader must admit to accept a
+	// DefaultMaxPayloadSize ledger: the payload plus this protocol's header.
+	// Capping a reader at the payload size alone would reject the largest ledger
+	// by exactly HeaderSize bytes.
+	DefaultMaxMessageSize = DefaultMaxPayloadSize + HeaderSize
 )
 
 // StreamPath is the endpoint a subscriber connects to. Its query parameters are

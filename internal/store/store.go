@@ -23,6 +23,9 @@ import (
 // caller's bounds check and its read).
 var ErrNotRetained = errors.New("store: ledger not retained")
 
+// ErrInvalidSequence is returned by Put for a sequence no ledger can have.
+var ErrInvalidSequence = errors.New("store: invalid ledger sequence")
+
 const (
 	filePrefix = "ledger-"
 	fileSuffix = ".xdr"
@@ -102,7 +105,15 @@ func (s *Store) rescan() error {
 // not continue the ring (a gap, or a rewind after a restart against an existing
 // directory) makes the retained range unusable for replay, so Put empties the
 // ring and starts a new one at seq. Reset reports whether that happened.
+//
+// Sequence 0 is rejected: stellar ledger sequences start at 1, so a 0 here means
+// a counter ran past math.MaxUint32 and wrapped. The protocol has no room for a
+// wrap, and accepting it would let a wrapped ring look contiguous.
 func (s *Store) Put(seq uint32, raw []byte) (reset bool, err error) {
+	if seq == 0 {
+		return false, fmt.Errorf("%w: ledger sequences start at 1, so 0 means a wrapped counter", ErrInvalidSequence)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -190,9 +201,15 @@ func (s *Store) pruneLocked() error {
 }
 
 func (s *Store) clearLocked() error {
-	for seq := s.oldest; s.filled && seq <= s.latest; seq++ {
+	// Breaking after the last sequence instead of testing seq <= latest keeps the
+	// loop finite when latest is math.MaxUint32, where seq++ would wrap to 0 and
+	// the comparison would never end it.
+	for seq := s.oldest; s.filled; seq++ {
 		if err := os.Remove(s.path(seq)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("store: clear ledger %d: %w", seq, err)
+		}
+		if seq == s.latest {
+			break
 		}
 	}
 	s.oldest, s.latest, s.filled = 0, 0, false

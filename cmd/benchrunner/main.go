@@ -201,7 +201,17 @@ func runLoopback(ctx context.Context, o options) (*collector, error) {
 	srvCtx, stopSource := context.WithCancel(ctx)
 	defer stopSource()
 	sourceDone := make(chan error, 1)
-	go func() { sourceDone <- srv.Run(srvCtx) }()
+	go func() {
+		// Hold the source until the consumer is subscribed. A ledger produced
+		// before then would be served from retention, and a replayed ledger
+		// carries no emit stamp — so it would silently drop out of the latency
+		// measurement this whole mode exists to take.
+		if err := waitForSubscriber(srvCtx, srv); err != nil {
+			sourceDone <- err
+			return
+		}
+		sourceDone <- srv.Run(srvCtx)
+	}()
 
 	url := "ws://" + ln.Addr().String()
 	fmt.Printf("loopback server on %s: %d ledgers of %d bytes every %s\n",
@@ -214,6 +224,20 @@ func runLoopback(ctx context.Context, o options) (*collector, error) {
 	}
 	stopSource()
 	return c, <-sourceDone
+}
+
+// waitForSubscriber blocks until srv has a connected consumer, or ctx ends.
+func waitForSubscriber(ctx context.Context, srv *server.Server) error {
+	ticker := time.NewTicker(200 * time.Microsecond)
+	defer ticker.Stop()
+	for srv.Subscribers() == 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+	return nil
 }
 
 // runRemote consumes a corestreamd that is already running, which is the

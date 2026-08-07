@@ -55,20 +55,30 @@ Close codes:
 
 A bounded range that ends short surfaces as `remoteledger.ErrTruncated`, naming the last ledger delivered and the one requested. The client decides that by comparing what arrived against what it asked for, not by trusting the close code — an orderly close from anywhere, including a middlebox, cannot make a short delivery look like a complete one. An unbounded stream has no such expectation, so a clean close simply ends iteration.
 
-The server pings every 15 s. The client accepts messages up to 256 MiB, matching the SDK's captive-core frame cap.
+The server pings every 15 s. The client accepts a ledger payload of up to 256 MiB, matching the SDK's captive-core frame cap; its WebSocket read limit is that plus the 14-byte header, so the largest ledger is not rejected by its own framing. `remoteledger.WithMaxMessageSize` moves that payload cap.
 
 ## Run the synthetic demo (no core binary, no network)
 
+The quickest look at the whole path is one command — server, client and measurement in a single process:
+
+```sh
+go run ./cmd/benchrunner --mode loopback
+```
+
+To drive the real service instead, start it in the **first shell**. It runs in the foreground until you interrupt it:
+
 ```sh
 go run ./cmd/corestreamd --source synthetic --synthetic-interval 1s --synthetic-size 204800
-curl -s localhost:8462/healthz    # {"oldest":1,"latest":12,"subscribers":0}
 ```
 
-Then consume it from another shell:
+In a **second shell**, check its health and then consume it:
 
 ```sh
+curl -s localhost:8462/healthz    # {"oldest":1,"latest":12,"subscribers":0}
 go run ./cmd/benchrunner --mode remote --url ws://127.0.0.1:8462 --start 1
 ```
+
+The client streams until you interrupt it, since `--start 1` with no `--end` is an unbounded range. Interrupt the server (Ctrl-C) when you are done; it removes nothing, so `--data-dir` keeps the retained ledgers for the next run.
 
 ## Run against real captive core
 

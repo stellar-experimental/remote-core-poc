@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"sync"
@@ -110,6 +111,9 @@ func New(cfg Config) (*Server, error) {
 	}, nil
 }
 
+// Subscribers is how many consumers are currently connected.
+func (s *Server) Subscribers() int { return s.b.count() }
+
 // Handler returns the HTTP surface: the stream endpoint and /healthz.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -203,6 +207,12 @@ func parseStreamRequest(q map[string][]string) (streamRequest, error) {
 	}
 	if hasEnd && end == 0 {
 		return req, errors.New("invalid end parameter: 0")
+	}
+	// Sequences are uint32 and the protocol has no wrap: serving the last
+	// representable ledger would leave the next one unnameable, so the edge is
+	// refused rather than half-supported.
+	if start == math.MaxUint32 || end == math.MaxUint32 {
+		return req, fmt.Errorf("ledger %d is the last representable sequence and is not streamable", uint32(math.MaxUint32))
 	}
 	if hasEnd && start > end {
 		return req, fmt.Errorf("end %d is before start %d", end, start)
@@ -451,7 +461,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	if err := json.NewEncoder(w).Encode(health{
 		Oldest:      oldest,
 		Latest:      latest,
-		Subscribers: s.b.count(),
+		Subscribers: s.Subscribers(),
 	}); err != nil {
 		s.log.Debug("healthz write failed", "error", err)
 	}

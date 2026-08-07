@@ -122,12 +122,16 @@ func percentileLine(label string, ds []time.Duration) string {
 }
 
 // percentile returns the p-th percentile of an already sorted slice, using
-// nearest-rank so no value is invented by interpolation.
+// nearest-rank so no value is invented by interpolation: the value at rank
+// ceil(p*n/100), which for n=10 makes p50 the 5th value and p99 the 10th.
 func percentile(sorted []time.Duration, p int) time.Duration {
 	if len(sorted) == 0 {
 		return 0
 	}
-	idx := (p * len(sorted)) / 100
+	idx := (p*len(sorted)+99)/100 - 1
+	if idx < 0 {
+		idx = 0
+	}
 	if idx >= len(sorted) {
 		idx = len(sorted) - 1
 	}

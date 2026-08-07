@@ -101,6 +101,18 @@ func TestDecodeErrors(t *testing.T) {
 	}
 }
 
+func TestDefaultSizeLimits(t *testing.T) {
+	// A reader capped at the payload size would reject the largest ledger by
+	// exactly the header, so the message limit has to carry both.
+	if DefaultMaxPayloadSize != 256<<20 {
+		t.Errorf("DefaultMaxPayloadSize = %d, want 256 MiB", DefaultMaxPayloadSize)
+	}
+	if DefaultMaxMessageSize != DefaultMaxPayloadSize+HeaderSize {
+		t.Errorf("DefaultMaxMessageSize = %d, want the payload limit plus %d",
+			DefaultMaxMessageSize, HeaderSize)
+	}
+}
+
 func TestAppendHeaderReusesBuffer(t *testing.T) {
 	buf := make([]byte, 0, 64)
 	buf = AppendHeader(buf, Header{Version: Version, Type: TypeLedger, Sequence: 3})

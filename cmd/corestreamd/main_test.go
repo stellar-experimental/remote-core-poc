@@ -1,9 +1,18 @@
 package main
 
 import (
+	"context"
 	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/stellar/remote-core-poc/internal/server"
+	"github.com/stellar/remote-core-poc/internal/store"
 )
 
 func TestParseFlagsDefaults(t *testing.T) {
@@ -74,6 +83,82 @@ func TestSplitURLs(t *testing.T) {
 	}
 	if len(splitURLs("")) != 0 {
 		t.Error("an empty list produced URLs")
+	}
+}
+
+// testServices builds a synthetic server and an HTTP server over a loopback
+// listener, the pair runServices supervises.
+func testServices(t *testing.T, count uint32) (*server.Server, *http.Server, net.Listener) {
+	t.Helper()
+	ring, err := store.Open(filepath.Join(t.TempDir(), "ledgers"), 100)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	srv, err := server.New(server.Config{
+		Source: server.NewSyntheticStream(server.SyntheticConfig{Size: 64, Interval: time.Millisecond}),
+		Range:  server.SyntheticRange(1, count),
+		Store:  ring,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	return srv, &http.Server{Handler: srv.Handler()}, ln
+}
+
+func quietLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func TestRunServicesStopsWhenTheSourceEnds(t *testing.T) {
+	srv, httpSrv, ln := testServices(t, 3)
+	addr := ln.Addr().String()
+
+	if err := runServices(t.Context(), srv, httpSrv, ln, quietLogger()); err != nil {
+		t.Fatalf("runServices: %v", err)
+	}
+	// The listener must be gone with the source: a server still accepting
+	// connections would hand subscribers an empty stream.
+	if _, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
+		t.Error("the HTTP listener is still accepting after the source ended")
+	}
+}
+
+func TestRunServicesStopsWhenTheHTTPServerFails(t *testing.T) {
+	// An endless source: if a Serve failure did not bring the process down, this
+	// call would never return and the test would time out.
+	srv, httpSrv, ln := testServices(t, 0)
+
+	// Closing the listener under Serve is how it fails in production too — the
+	// socket going away.
+	if err := ln.Close(); err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+
+	err := runServices(t.Context(), srv, httpSrv, ln, quietLogger())
+	if err == nil {
+		t.Fatal("runServices returned no error after the HTTP server failed")
+	}
+	if !strings.Contains(err.Error(), "http server") {
+		t.Errorf("error = %v, want it to name the http server", err)
+	}
+}
+
+func TestRunServicesStopsOnContextCancel(t *testing.T) {
+	// A SIGINT arrives as a cancelled context: both components stop and the exit
+	// is clean, not an error.
+	srv, httpSrv, ln := testServices(t, 0)
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+	if err := runServices(ctx, srv, httpSrv, ln, quietLogger()); err != nil {
+		t.Fatalf("runServices after cancel: %v", err)
 	}
 }
 

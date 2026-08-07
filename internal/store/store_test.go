@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,11 +14,16 @@ func ledgerBytes(seq uint32) []byte {
 	return bytes.Repeat([]byte{byte(seq)}, 32)
 }
 
+// putN stores ledgers from..to inclusive. It breaks after to instead of testing
+// seq <= to so that a range ending at math.MaxUint32 terminates.
 func putN(t *testing.T, s *Store, from, to uint32) {
 	t.Helper()
-	for seq := from; seq <= to; seq++ {
+	for seq := from; ; seq++ {
 		if _, err := s.Put(seq, ledgerBytes(seq)); err != nil {
 			t.Fatalf("Put(%d): %v", seq, err)
+		}
+		if seq == to {
+			return
 		}
 	}
 }
@@ -207,6 +213,47 @@ func TestPutResetsOnRewind(t *testing.T) {
 		t.Error("Put that rewinds did not report a reset")
 	}
 	wantBounds(t, s, 50, 50)
+}
+
+func TestPutRejectsSequenceZero(t *testing.T) {
+	// Ledger sequences start at 1, so a 0 means a counter wrapped past
+	// math.MaxUint32. Accepting it would let a wrapped ring look contiguous.
+	s, err := Open(t.TempDir(), 10)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := s.Put(0, ledgerBytes(0)); !errors.Is(err, ErrInvalidSequence) {
+		t.Fatalf("Put(0) error = %v, want ErrInvalidSequence", err)
+	}
+	if _, _, filled := s.Bounds(); filled {
+		t.Error("the rejected ledger was retained anyway")
+	}
+
+	// Also at the ceiling, where latest+1 is what wraps to 0.
+	putN(t, s, math.MaxUint32-1, math.MaxUint32)
+	if _, err := s.Put(0, ledgerBytes(0)); !errors.Is(err, ErrInvalidSequence) {
+		t.Errorf("Put(0) after the ceiling error = %v, want ErrInvalidSequence", err)
+	}
+	wantBounds(t, s, math.MaxUint32-1, math.MaxUint32)
+}
+
+func TestPutResetsAtTheSequenceCeiling(t *testing.T) {
+	// Nothing can continue math.MaxUint32, so the next ledger restarts the ring.
+	// The clearing loop must not run forever counting past the ceiling.
+	s, err := Open(t.TempDir(), 10)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	putN(t, s, math.MaxUint32-2, math.MaxUint32)
+
+	reset, err := s.Put(7, ledgerBytes(7))
+	if err != nil {
+		t.Fatalf("Put(7) after the ceiling: %v", err)
+	}
+	if !reset {
+		t.Error("a ledger that cannot continue the ceiling did not reset the ring")
+	}
+	wantBounds(t, s, 7, 7)
 }
 
 func TestGetAfterPruneRace(t *testing.T) {

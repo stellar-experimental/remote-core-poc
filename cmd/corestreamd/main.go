@@ -28,6 +28,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -197,25 +198,74 @@ func run() error {
 	logger.Info("corestreamd listening", "addr", ln.Addr().String(), "source", o.source,
 		"start_ledger", start, "retention", o.retention)
 
-	serveErr := make(chan error, 1)
+	return runServices(ctx, srv, httpSrv, ln, logger)
+}
+
+// shutdownTimeout bounds the graceful HTTP shutdown once the process is on its
+// way out.
+const shutdownTimeout = 5 * time.Second
+
+// runServices runs the source loop and the HTTP server until the first of them
+// returns, then stops the other and waits for it.
+//
+// Neither component is useful alone: a source loop with no listener streams to
+// nobody, and a listener with no source hands every subscriber an empty stream.
+// So the first one to return — whether it failed or simply finished — ends the
+// process, and its error (if any) is what the caller reports.
+func runServices(
+	ctx context.Context, srv *server.Server, httpSrv *http.Server, ln net.Listener, logger *slog.Logger,
+) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
 	go func() {
-		err := httpSrv.Serve(ln)
-		if errors.Is(err, http.ErrServerClosed) {
-			err = nil
-		}
-		serveErr <- err
+		defer wg.Done()
+		// Cancelling on the way out is what makes the other component stop.
+		defer cancel()
+		errs <- srv.Run(ctx)
 	}()
 
-	// The source loop decides the process lifetime: when the source ends, the
-	// service has nothing left to serve.
-	runErr := srv.Run(ctx)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer cancel()
+		err := httpSrv.Serve(ln)
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil // our own shutdown, not a failure
+		}
+		if err != nil {
+			err = fmt.Errorf("http server: %w", err)
+		}
+		errs <- err
+	}()
 
-	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancelShutdown()
-	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
-		logger.Warn("http shutdown did not finish cleanly", "error", err)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-ctx.Done()
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancelShutdown()
+		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("http shutdown did not finish cleanly", "error", err)
+		}
+	}()
+
+	wg.Wait()
+	close(errs)
+	var joined error
+	for err := range errs {
+		joined = errors.Join(joined, err)
 	}
-	return errors.Join(runErr, <-serveErr)
+	if joined != nil {
+		logger.Error("corestreamd stopping on failure", "error", joined)
+	} else {
+		logger.Info("corestreamd stopped")
+	}
+	return joined
 }
 
 func splitURLs(csv string) []string {
