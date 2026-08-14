@@ -11,7 +11,7 @@
 //	  --history-archive-urls https://history.stellar.org/prd/core-live/core_live_001 \
 //	  --storage-dir /data/core
 //
-// Subscribers connect with github.com/stellar/remote-core-poc/remoteledger.
+// Subscribers connect with github.com/stellar-experimental/remote-core-poc/remoteledger.
 package main
 
 import (
@@ -35,9 +35,9 @@ import (
 	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
 	supportlog "github.com/stellar/go-stellar-sdk/support/log"
 
-	"github.com/stellar/remote-core-poc/internal/server"
-	"github.com/stellar/remote-core-poc/internal/store"
-	"github.com/stellar/remote-core-poc/internal/wire"
+	"github.com/stellar-experimental/remote-core-poc/internal/server"
+	"github.com/stellar-experimental/remote-core-poc/internal/store"
+	"github.com/stellar-experimental/remote-core-poc/internal/wire"
 )
 
 func main() {

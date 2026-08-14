@@ -18,8 +18,8 @@ import (
 
 	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
 
-	"github.com/stellar/remote-core-poc/internal/store"
-	"github.com/stellar/remote-core-poc/remoteledger"
+	"github.com/stellar-experimental/remote-core-poc/internal/store"
+	"github.com/stellar-experimental/remote-core-poc/remoteledger"
 )
 
 // consumer collects sequences, payload copies and any error from one

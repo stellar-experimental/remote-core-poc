@@ -34,9 +34,9 @@ import (
 	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
 	supportlog "github.com/stellar/go-stellar-sdk/support/log"
 
-	"github.com/stellar/remote-core-poc/internal/server"
-	"github.com/stellar/remote-core-poc/internal/store"
-	"github.com/stellar/remote-core-poc/remoteledger"
+	"github.com/stellar-experimental/remote-core-poc/internal/server"
+	"github.com/stellar-experimental/remote-core-poc/internal/store"
+	"github.com/stellar-experimental/remote-core-poc/remoteledger"
 )
 
 func main() {

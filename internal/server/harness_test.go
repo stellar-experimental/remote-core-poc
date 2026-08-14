@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stellar/remote-core-poc/internal/store"
+	"github.com/stellar-experimental/remote-core-poc/internal/store"
 )
 
 // harnessOpts configures a test server backed by the synthetic source.

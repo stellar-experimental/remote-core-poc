@@ -1,4 +1,4 @@
-module github.com/stellar/remote-core-poc
+module github.com/stellar-experimental/remote-core-poc
 
 go 1.26
 

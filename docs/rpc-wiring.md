@@ -49,7 +49,7 @@ type CoreOpener interface {
  	github.com/spf13/cobra v1.7.0
  	github.com/spf13/pflag v1.0.5
  	github.com/stellar/go-stellar-sdk v0.7.1
-+	github.com/stellar/remote-core-poc v0.1.0
++	github.com/stellar-experimental/remote-core-poc v0.1.0
  	github.com/stellar/streamhash v0.0.0-20260713164615-c72a4e6f578d
  	github.com/stretchr/testify v1.11.1
  )
@@ -58,7 +58,7 @@ type CoreOpener interface {
 The prototype is not published, so until it is, point the require at a checkout:
 
 ```diff
-+replace github.com/stellar/remote-core-poc => ../remote-core-poc
++replace github.com/stellar-experimental/remote-core-poc => ../remote-core-poc
 ```
 
 `go mod tidy` then adds `github.com/coder/websocket` as an indirect dependency — the only new transitive dependency.
@@ -146,7 +146,7 @@ The prototype is not published, so until it is, point the require at a checkout:
  	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
  	supportlog "github.com/stellar/go-stellar-sdk/support/log"
  	"github.com/stellar/go-stellar-sdk/support/storage"
-+	"github.com/stellar/remote-core-poc/remoteledger"
++	"github.com/stellar-experimental/remote-core-poc/remoteledger"
  
  	"github.com/stellar/stellar-rpc/cmd/stellar-rpc/internal/host"
  	"github.com/stellar/stellar-rpc/cmd/stellar-rpc/internal/preflight"

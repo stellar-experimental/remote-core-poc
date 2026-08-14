@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stellar/remote-core-poc/internal/server"
-	"github.com/stellar/remote-core-poc/internal/store"
-	"github.com/stellar/remote-core-poc/internal/wire"
+	"github.com/stellar-experimental/remote-core-poc/internal/server"
+	"github.com/stellar-experimental/remote-core-poc/internal/store"
+	"github.com/stellar-experimental/remote-core-poc/internal/wire"
 )
 
 func TestParseFlagsDefaults(t *testing.T) {

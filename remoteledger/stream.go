@@ -22,7 +22,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
 
-	"github.com/stellar/remote-core-poc/internal/wire"
+	"github.com/stellar-experimental/remote-core-poc/internal/wire"
 )
 
 // Stream errors. Both are close conditions the server states explicitly, so a
