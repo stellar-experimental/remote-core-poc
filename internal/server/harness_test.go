@@ -20,7 +20,6 @@ type harnessOpts struct {
 	size      int
 	interval  time.Duration
 	retention int
-	buffer    int
 }
 
 // harness is a running server: a real HTTP listener on 127.0.0.1 with the source
@@ -56,11 +55,10 @@ func startHarness(t *testing.T, opts harnessOpts) *harness {
 		t.Fatalf("store.Open: %v", err)
 	}
 	srv, err := New(Config{
-		Source:           NewSyntheticStream(SyntheticConfig{Size: opts.size, Interval: opts.interval}),
-		Range:            SyntheticRange(opts.start, opts.count),
-		Store:            ring,
-		SubscriberBuffer: opts.buffer,
-		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Source: NewSyntheticStream(SyntheticConfig{Size: opts.size, Interval: opts.interval}),
+		Range:  SyntheticRange(opts.start, opts.count),
+		Store:  ring,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
 		t.Fatalf("server.New: %v", err)

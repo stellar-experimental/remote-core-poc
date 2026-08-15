@@ -25,18 +25,12 @@ import (
 	"github.com/stellar-experimental/remote-core-poc/internal/wire"
 )
 
-// Stream errors. Both are close conditions the server states explicitly, so a
-// consumer can tell them from a transport failure.
+// Stream errors, each distinguishable from a transport failure with errors.Is.
 var (
 	// ErrTooFarBehind means the requested start ledger is older than the
 	// server's retention. Use errors.As with *TooFarBehindError to read the
 	// bounds the server reported.
 	ErrTooFarBehind = errors.New("remoteledger: requested ledger is behind the server's retention")
-
-	// ErrSlowConsumer means this consumer could not keep up: the server dropped
-	// ledgers rather than stall its source, and disconnected us. A resume from
-	// the last ledger received is the way back.
-	ErrSlowConsumer = errors.New("remoteledger: consumer fell behind and was disconnected")
 
 	// ErrGap means the server delivered a sequence that does not continue the
 	// stream. Ledgers must arrive in order with none missing.
@@ -335,8 +329,6 @@ func classifyClose(readErr error, requested uint32) (done bool, err error) {
 			}
 		}
 		return true, tfb
-	case wire.StatusSlowConsumer:
-		return true, ErrSlowConsumer
 	default:
 		return false, nil
 	}

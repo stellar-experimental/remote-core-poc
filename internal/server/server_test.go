@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -22,25 +23,32 @@ import (
 	"github.com/stellar-experimental/remote-core-poc/remoteledger"
 )
 
-// consumer collects sequences, payload copies and any error from one
-// subscription. It is the assertion surface of the end-to-end tests: what a real
-// consumer of the seam sees.
+// consumer collects sequences, emit stamps, payload copies and any error from
+// one subscription. It is the assertion surface of the end-to-end tests: what a
+// real consumer of the seam sees.
 type consumer struct {
 	seqs     []uint32
+	stamps   []int64 // zero means the ledger was served from the retention ring
 	payloads [][]byte
 	err      error
 }
 
 // consume subscribes to h over rng and reads until the stream ends, limit
-// ledgers have arrived (limit > 0), or onLedger asks it to stop.
+// ledgers have arrived (limit > 0), or onLedger asks it to stop. The deadline
+// turns a stream that wedges — a lost wakeup, a subscriber asleep forever —
+// into a test failure instead of a package timeout.
 func consume(
 	ctx context.Context, t *testing.T, url string, rng ledgerbackend.Range, limit int, onLedger func(seq uint32),
 ) *consumer {
 	t.Helper()
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	c := &consumer{}
 	var seq uint32
+	var stamp int64
 	stream := remoteledger.New(url, remoteledger.WithObserver(func(info remoteledger.LedgerInfo) {
 		seq = info.Sequence
+		stamp = info.EmitUnixNano
 	}))
 	for raw, err := range stream.RawLedgers(ctx, rng) {
 		if err != nil {
@@ -48,6 +56,7 @@ func consume(
 			return c
 		}
 		c.seqs = append(c.seqs, seq)
+		c.stamps = append(c.stamps, stamp)
 		c.payloads = append(c.payloads, bytes.Clone(raw))
 		if onLedger != nil {
 			onLedger(seq)
@@ -57,6 +66,19 @@ func consume(
 		}
 	}
 	return c
+}
+
+// stallOnFirstLedger returns a consume callback that parks the subscriber on
+// its first ledger until the harness's source loop has finished, so whatever
+// the subscriber still needs must come out of the retention ring.
+func stallOnFirstLedger(t *testing.T, h *harness) func(uint32) {
+	return func(seq uint32) {
+		if seq == 1 {
+			if err := h.wait(t); err != nil {
+				t.Errorf("source loop: %v", err)
+			}
+		}
+	}
 }
 
 // wantContiguous checks the delivered sequences are exactly from..to, in order.
@@ -212,10 +234,10 @@ func TestUnboundedSubscriptionEndsCleanlyWhenSourceEnds(t *testing.T) {
 }
 
 func TestReplayTerminatesAtTheSequenceCeiling(t *testing.T) {
-	// The retained window ends at math.MaxUint32, where incrementing the replay
-	// cursor wraps to 0. A cursor that wraps asks the store for ledger 0, which is
-	// not retained — so the subscriber would be told it is too far behind right
-	// after being served the whole window it asked for.
+	// The retained window ends at math.MaxUint32. A uint32 cursor stepping past
+	// it would wrap to 0 and re-anchor at the tip, re-serving ledgers forever;
+	// the cursor is wider than a sequence precisely so serving the ceiling
+	// leaves it one past MaxUint32 and the subscription just waits out the end.
 	const first = uint32(math.MaxUint32 - 2)
 	h := startHarness(t, harnessOpts{start: first, count: 3})
 	if err := h.wait(t); err != nil {
@@ -355,44 +377,107 @@ func TestUnboundedStreamCancelTearsDown(t *testing.T) {
 	}
 }
 
-func TestSlowSubscriberIsDroppedWithoutHurtingOthers(t *testing.T) {
-	// A queue of one and payloads big enough to fill the socket buffers is what
-	// makes falling behind unavoidable for the subscriber that stops reading.
+func TestStalledSubscriberCatchesUpWithoutHurtingOthers(t *testing.T) {
+	// Payloads big enough to fill the socket buffers make the stall real: the
+	// server cannot write ahead, so the subscriber genuinely falls behind the
+	// tip and has to be served the difference from the retention ring.
 	h := startHarness(t, harnessOpts{
-		count: 80, size: 256 << 10, interval: time.Millisecond, buffer: 1, retention: 200,
+		count: 80, size: 256 << 10, interval: time.Millisecond, retention: 200,
 	})
 
 	healthy := make(chan *consumer, 1)
 	go func() {
-		healthy <- consume(t.Context(), t, h.url, ledgerbackend.UnboundedRange(1), 5, nil)
+		healthy <- consume(t.Context(), t, h.url, ledgerbackend.UnboundedRange(1), 0, nil)
 	}()
 
-	stalled := consume(t.Context(), t, h.url, ledgerbackend.UnboundedRange(1), 0, func(seq uint32) {
-		if seq == 1 {
-			// Long enough for the source to overrun a one-deep queue.
-			time.Sleep(500 * time.Millisecond)
-		}
-	})
-	if !errors.Is(stalled.err, remoteledger.ErrSlowConsumer) {
-		t.Fatalf("stalled subscriber error = %v, want ErrSlowConsumer", stalled.err)
+	// The stall leaves the subscriber far behind the tip when it resumes;
+	// retention still covers everything, so it must catch up, not be dropped.
+	stalled := consume(t.Context(), t, h.url, ledgerbackend.UnboundedRange(1), 0, stallOnFirstLedger(t, h))
+	if stalled.err != nil {
+		t.Fatalf("stalled subscriber error = %v, want a clean catch-up to the end", stalled.err)
 	}
-	for i := 1; i < len(stalled.seqs); i++ {
-		if stalled.seqs[i] != stalled.seqs[i-1]+1 {
-			t.Fatalf("stalled subscriber saw a gap before being dropped: %v", stalled.seqs)
-		}
+	wantContiguous(t, stalled.seqs, 1, 80)
+	if !slices.Contains(stalled.stamps, 0) {
+		t.Error("every ledger arrived with an emit stamp: the catch-up was never served from the retention ring")
 	}
 
+	// The healthy subscriber reads the whole run: had the stalled one wedged
+	// the source loop, this one would sit short of 80 until consume's deadline.
 	other := <-healthy
 	if other.err != nil {
 		t.Errorf("the subscriber that kept up failed: %v", other.err)
 	}
-	if len(other.seqs) != 5 {
-		t.Errorf("the subscriber that kept up received %d ledgers, want 5", len(other.seqs))
+	wantContiguous(t, other.seqs, 1, 80)
+}
+
+func TestStalledSubscriberFallingOutOfRetentionIsTooFarBehind(t *testing.T) {
+	// Retention far smaller than the run: by the time the stalled subscriber
+	// resumes, the ledgers it still needs are pruned. The stream must end with
+	// the too-far-behind refusal — a gap disguised as a clean close would make
+	// the consumer trust a stream it did not receive. Retention is 20, not
+	// smaller, so ledger 1 stays retained long enough for the subscriber to
+	// receive it and stall on it; and the payloads are large enough that the
+	// socket buffers cannot swallow the whole run while nobody reads.
+	h := startHarness(t, harnessOpts{
+		count: 100, size: 256 << 10, interval: time.Millisecond, retention: 20,
+	})
+
+	c := consume(t.Context(), t, h.url, ledgerbackend.UnboundedRange(1), 0, stallOnFirstLedger(t, h))
+	if !errors.Is(c.err, remoteledger.ErrTooFarBehind) {
+		t.Fatalf("error = %v, want ErrTooFarBehind", c.err)
 	}
-	for i := 1; i < len(other.seqs); i++ {
-		if other.seqs[i] != other.seqs[i-1]+1 {
-			t.Errorf("the subscriber that kept up saw a gap: %v", other.seqs)
+	var tfb *remoteledger.TooFarBehindError
+	if !errors.As(c.err, &tfb) {
+		t.Fatalf("error %v does not carry a TooFarBehindError", c.err)
+	}
+	// The exact bounds depend on when the cursor lost the pruning race, so
+	// assert the shape: a full-width window that has moved past ledger 1.
+	if tfb.Latest-tfb.Oldest+1 != 20 || tfb.Oldest <= 1 {
+		t.Errorf("reported retention [%d,%d], want a 20-ledger window past ledger 1", tfb.Oldest, tfb.Latest)
+	}
+	// Whatever arrived before the refusal must be gapless from the start.
+	if len(c.seqs) == 0 {
+		t.Fatal("received no ledgers, want a stream starting at ledger 1")
+	}
+	wantContiguous(t, c.seqs, 1, uint32(len(c.seqs)))
+	if len(c.seqs) >= 100 {
+		t.Errorf("received all %d ledgers, want the stream cut short by pruning", len(c.seqs))
+	}
+}
+
+func TestManySubscribersShareTheStream(t *testing.T) {
+	// Every subscriber's write hands out the same tip.msg backing array, and
+	// the race detector only sees that sharing when many goroutines do it at
+	// once. Payload equality is the corruption check.
+	h := startHarness(t, harnessOpts{count: 50, size: 4 << 10, interval: time.Millisecond})
+
+	const subscribers = 8
+	results := make(chan *consumer, subscribers)
+	for range subscribers {
+		go func() {
+			results <- consume(t.Context(), t, h.url, ledgerbackend.UnboundedRange(1), 0, nil)
+		}()
+	}
+	anyStamped := false
+	for range subscribers {
+		c := <-results
+		if c.err != nil {
+			t.Errorf("subscriber failed: %v", c.err)
+			continue
 		}
+		wantContiguous(t, c.seqs, 1, 50)
+		for i, seq := range c.seqs {
+			if !bytes.Equal(c.payloads[i], h.payload(seq)) {
+				t.Errorf("ledger %d payload does not match what the source produced", seq)
+				break
+			}
+			anyStamped = anyStamped || c.stamps[i] != 0
+		}
+	}
+	// If no ledger anywhere carried a stamp, nobody was ever served the shared
+	// tip message and this test silently stopped exercising the sharing.
+	if !anyStamped {
+		t.Error("no subscriber received a stamped ledger: the tip fast path was never taken")
 	}
 }
 
