@@ -7,7 +7,10 @@
 // emitUnixNano is the server wall clock at the moment the ledger arrived from
 // the source. It is zero when the ledger was replayed from the retention store,
 // because the original arrival time is not persisted: a replayed ledger carries
-// no delivery-latency measurement.
+// no delivery-latency measurement. One asymmetry: the newest ledger is served
+// from memory with its original stamp even to a subscriber replaying long
+// after it was emitted, so a stamp measures delivery latency only on a stream
+// being followed live.
 package wire
 
 import (
@@ -44,13 +47,9 @@ const StreamPath = "/v1/stream"
 
 // Application close codes, in the WebSocket private range.
 const (
-	// StatusTooFarBehind means the requested start ledger is older than the
+	// StatusTooFarBehind means the subscriber needs a ledger older than the
 	// server's retention. The close reason carries the retained bounds.
 	StatusTooFarBehind = 4001
-
-	// StatusSlowConsumer means the subscriber could not keep up and the server
-	// dropped ledgers rather than stall the source.
-	StatusSlowConsumer = 4002
 )
 
 // Decode errors.

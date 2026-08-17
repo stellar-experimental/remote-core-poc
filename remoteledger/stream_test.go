@@ -303,20 +303,6 @@ func TestRawLedgersTooFarBehindWithoutBounds(t *testing.T) {
 	}
 }
 
-func TestRawLedgersSlowConsumer(t *testing.T) {
-	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
-		sendLedgers(t, conn, ctx, 16, 1)
-		_ = conn.Close(wire.StatusSlowConsumer, "subscriber too slow")
-	})
-	r := drain(t.Context(), New(url), ledgerbackend.UnboundedRange(1))
-	if !errors.Is(r.err, ErrSlowConsumer) {
-		t.Fatalf("error = %v, want ErrSlowConsumer", r.err)
-	}
-	if r.count != 1 {
-		t.Errorf("received %d ledgers before being dropped, want 1", r.count)
-	}
-}
-
 func TestRawLedgersRejectsBadMessages(t *testing.T) {
 	tests := []struct {
 		name string

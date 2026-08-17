@@ -4,87 +4,63 @@ import (
 	"sync"
 )
 
-// DefaultSubscriberBuffer is how many live ledgers a subscriber may fall behind
-// before the server gives up on it.
-const DefaultSubscriberBuffer = 64
-
-// liveLedger is one encoded wire message plus the sequence it carries, queued
-// for delivery to a subscriber.
+// liveLedger is one encoded wire message plus the sequence it carries: the tip
+// of the stream as the source loop last published it.
 type liveLedger struct {
 	seq uint32
 	msg []byte
 }
 
-// subscriber is one connected consumer's queue. The source loop fills ch and
-// never blocks on it: a full queue means this consumer cannot keep up, which
-// closes dropped and makes its handler disconnect it.
-type subscriber struct {
-	ch      chan liveLedger
-	dropped chan struct{}
-	once    sync.Once
-}
-
-func (s *subscriber) drop() {
-	s.once.Do(func() { close(s.dropped) })
-}
-
-// broadcaster fans one source out to every subscriber.
+// broadcaster is a single-value watch over the most recently published ledger.
+// Subscribers are cursors over the retention store; the only things pushed at
+// them are the current tip and a wakeup when it moves. There is no
+// per-subscriber queue to overflow: a subscriber that falls behind reads what
+// it missed back out of the store.
 type broadcaster struct {
-	buffer int
-
-	mu   sync.Mutex
-	subs map[*subscriber]struct{}
+	mu     sync.Mutex
+	latest liveLedger    // seq 0 until the first publish
+	notify chan struct{} // closed on every publish, and once more by finish
+	ended  bool          // the tip is final; no publish may follow
 }
 
-func newBroadcaster(buffer int) *broadcaster {
-	if buffer <= 0 {
-		buffer = DefaultSubscriberBuffer
-	}
-	return &broadcaster{buffer: buffer, subs: make(map[*subscriber]struct{})}
+func newBroadcaster() *broadcaster {
+	return &broadcaster{notify: make(chan struct{})}
 }
 
-func (b *broadcaster) subscribe() *subscriber {
-	s := &subscriber{
-		ch:      make(chan liveLedger, b.buffer),
-		dropped: make(chan struct{}),
-	}
-	b.mu.Lock()
-	b.subs[s] = struct{}{}
-	b.mu.Unlock()
-	return s
-}
-
-func (b *broadcaster) unsubscribe(s *subscriber) {
-	b.mu.Lock()
-	delete(b.subs, s)
-	b.mu.Unlock()
-}
-
-// publish queues l for every subscriber. It never blocks: a subscriber whose
-// queue is full is dropped instead, so one slow consumer cannot stall the
-// source loop or the consumers keeping up.
+// publish makes l the tip and wakes every watcher. It never blocks: waking is
+// closing a channel, so nothing a subscriber does can stall the source loop,
+// and its cost does not grow with the subscriber count.
 func (b *broadcaster) publish(l liveLedger) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for s := range b.subs {
-		select {
-		case <-s.dropped:
-			// Already given up on. Queuing more would hand this subscriber a
-			// ledger that does not follow the last one it received, turning a
-			// clean "too slow" close into an apparent sequence gap.
-			continue
-		default:
-		}
-		select {
-		case s.ch <- l:
-		default:
-			s.drop()
-		}
+	if b.ended {
+		// Named panic, and the deferred unlock releases the mutex: a recover
+		// upstream must not leave every watcher deadlocked on b.mu.
+		panic("server: ledger published after the stream was finished")
 	}
+	b.latest = l
+	close(b.notify)
+	b.notify = make(chan struct{})
 }
 
-func (b *broadcaster) count() int {
+// finish marks the tip final and wakes every watcher one last time.
+func (b *broadcaster) finish() {
+	b.mu.Lock()
+	if !b.ended {
+		b.ended = true
+		close(b.notify)
+	}
+	b.mu.Unlock()
+}
+
+// watch returns the current tip, a channel that is closed the next time
+// anything changes, and whether the tip is final. Take the channel before
+// deciding to sleep: a publish landing after watch returns has already closed
+// it, so the sleep wakes immediately instead of missing the ledger. Because
+// finish shares the tip's lock, an ended watch has already seen the last
+// ledger the source will ever produce.
+func (b *broadcaster) watch() (liveLedger, <-chan struct{}, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return len(b.subs)
+	return b.latest, b.notify, b.ended
 }

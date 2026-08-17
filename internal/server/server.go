@@ -3,8 +3,11 @@
 //
 // A single source loop pulls ledgers from a ledgerbackend.LedgerStream, copies
 // each one out of the borrowed iterator slice, appends it to a retention ring
-// and fans it out to the connected subscribers. Nothing a subscriber does can
-// slow that loop down: a consumer that falls behind its queue is disconnected.
+// and moves the published tip forward. Each subscriber is a cursor over the
+// ring: it reads from the store while behind the tip and is woken when the tip
+// moves. Nothing a subscriber does can slow the source loop down, and a slow
+// subscriber is never disconnected for lagging — it catches back up from the
+// ring, and only falling out of retention entirely ends its stream.
 package server
 
 import (
@@ -16,7 +19,6 @@ import (
 	"math"
 	"net/http"
 	"strconv"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -27,13 +29,12 @@ import (
 	"github.com/stellar-experimental/remote-core-poc/internal/wire"
 )
 
-// DefaultPingInterval is how often the server pings an idle subscriber, so a
-// connection that died without a FIN is noticed.
-const DefaultPingInterval = 15 * time.Second
-
-// writeTimeout bounds a single message write. The read side of a subscriber
-// closing cleanly cancels the handler's context, but a peer that vanished
-// without a reset would otherwise leave a handler blocked in write forever.
+// writeTimeout bounds a single message write, and is the server's liveness
+// authority: a peer that vanished without a reset is noticed here once ledgers
+// flow, or by the OS's TCP keepalive surfacing through the handler's read side
+// while the stream is quiet. There is no WebSocket-level ping — a subscriber
+// stalled mid-iteration cannot pong, and disconnecting it for that would break
+// the promise that only falling out of retention ends a subscription.
 const writeTimeout = 2 * time.Minute
 
 // maxPayloadSize is the largest ledger the protocol can carry. It is a variable
@@ -50,15 +51,8 @@ type Config struct {
 	// ledger: the server counts sequences from it.
 	Range ledgerbackend.Range
 
-	// Store is the retention ring replays are served from.
+	// Store is the retention ring replays and catch-ups are served from.
 	Store *store.Store
-
-	// SubscriberBuffer is the per-subscriber queue depth. Zero means
-	// DefaultSubscriberBuffer.
-	SubscriberBuffer int
-
-	// PingInterval is the keepalive period. Zero means DefaultPingInterval.
-	PingInterval time.Duration
 
 	// Logger receives structured logs. Zero means slog.Default().
 	Logger *slog.Logger
@@ -72,14 +66,8 @@ type Server struct {
 	b      *broadcaster
 	log    *slog.Logger
 
-	pingInterval time.Duration
-
-	// sourceDone is closed when the source loop ends, which lets each handler
-	// finish its subscriber off cleanly instead of hanging on a dead source.
-	sourceDone chan struct{}
-	doneOnce   sync.Once
-
-	published atomic.Uint64
+	published   atomic.Uint64
+	subscribers atomic.Int64
 }
 
 // New validates cfg and returns a server. It does not touch the source; Run
@@ -101,23 +89,17 @@ func New(cfg Config) (*Server, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	ping := cfg.PingInterval
-	if ping <= 0 {
-		ping = DefaultPingInterval
-	}
 	return &Server{
-		source:       cfg.Source,
-		rng:          cfg.Range,
-		store:        cfg.Store,
-		b:            newBroadcaster(cfg.SubscriberBuffer),
-		log:          logger,
-		pingInterval: ping,
-		sourceDone:   make(chan struct{}),
+		source: cfg.Source,
+		rng:    cfg.Range,
+		store:  cfg.Store,
+		b:      newBroadcaster(),
+		log:    logger,
 	}, nil
 }
 
 // Subscribers is how many consumers are currently connected.
-func (s *Server) Subscribers() int { return s.b.count() }
+func (s *Server) Subscribers() int { return int(s.subscribers.Load()) }
 
 // Handler returns the HTTP surface: the stream endpoint and /healthz.
 func (s *Server) Handler() http.Handler {
@@ -135,7 +117,7 @@ func (s *Server) Handler() http.Handler {
 // close — there is nothing more to stream, and a subscriber waiting on a dead
 // source would hang.
 func (s *Server) Run(ctx context.Context) error {
-	defer s.doneOnce.Do(func() { close(s.sourceDone) })
+	defer s.b.finish()
 
 	seq := s.rng.From()
 	s.log.Info("source loop starting", "range", s.rng.String())
@@ -178,7 +160,7 @@ func (s *Server) Run(ctx context.Context) error {
 		if seq%100 == 0 {
 			oldest, latest, _ := s.store.Bounds()
 			s.log.Info("streaming", "ledger", seq, "bytes", len(payload),
-				"retained_oldest", oldest, "retained_latest", latest, "subscribers", s.b.count())
+				"retained_oldest", oldest, "retained_latest", latest, "subscribers", s.Subscribers())
 		}
 		seq++
 	}
@@ -252,32 +234,17 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	defer conn.CloseNow()
 
 	// Subscribers only receive. A low read limit caps what a misbehaving one can
-	// make the server buffer, and CloseRead answers pings and notices the peer
-	// going away — which is also what makes our own pings work.
+	// make the server buffer, and CloseRead notices the peer going away —
+	// including via the OS's TCP keepalive when it vanished without a reset.
 	conn.SetReadLimit(1024)
 	ctx := conn.CloseRead(r.Context())
 
 	log := s.log.With("remote", r.RemoteAddr, "start", req.start, "end", req.end, "bounded", req.bounded)
 
-	// Register before reading the retained bounds: a ledger published during
-	// replay must be queued, not missed.
-	sub := s.b.subscribe()
-	defer s.b.unsubscribe(sub)
-	log.Info("subscriber connected", "subscribers", s.b.count())
+	log.Info("subscriber connected", "subscribers", s.subscribers.Add(1))
+	defer s.subscribers.Add(-1)
 
-	var wg sync.WaitGroup
-	pingCtx, stopPing := context.WithCancel(ctx)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		s.keepalive(pingCtx, conn)
-	}()
-	defer func() {
-		stopPing()
-		wg.Wait()
-	}()
-
-	code, reason, err := s.serve(ctx, conn, sub, req)
+	code, reason, err := s.serve(ctx, conn, req)
 	if err != nil {
 		log.Info("subscriber disconnected", "error", err)
 		return
@@ -288,186 +255,114 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// serve runs one subscription: replay from retention, then the live stream. It
-// returns the close code to send, or an error when the connection is already
-// broken and a close handshake is pointless.
+// serve runs one subscription as a cursor over the retention ring: read from
+// the store while behind, write the in-memory tip message when the cursor is
+// exactly the tip, otherwise sleep until the tip moves. Catch-up is not a
+// separate phase — it is what the loop does whenever the cursor is behind,
+// including right after connecting. That is also why a subscriber that stalls
+// is never disconnected for lagging: the ledgers it missed are read back from
+// the ring, and only falling out of retention ends the subscription.
+//
+// It returns the close code to send, or an error when the connection is
+// already broken and a close handshake is pointless.
 func (s *Server) serve(
-	ctx context.Context, conn *websocket.Conn, sub *subscriber, req streamRequest,
+	ctx context.Context, conn *websocket.Conn, req streamRequest,
 ) (websocket.StatusCode, string, error) {
-	// next is the sequence this subscriber expects. Zero means "whatever the
-	// first live ledger turns out to be" — the tip subscription.
-	next := req.start
+	// next is the sequence the subscriber expects, one past the last write. It
+	// is a uint64 so serving the last representable ledger leaves it one past
+	// math.MaxUint32 instead of wrapping to 0 and re-reading the ring. Zero
+	// means the tip subscription, not yet anchored to a sequence.
+	next := uint64(req.start)
 
-	if req.start > 0 {
-		done, err := s.replay(ctx, conn, req, &next)
-		if err != nil {
-			return 0, "", err
-		}
-		if done.set {
-			return done.code, done.reason, nil
+	// A tip subscription starts after the tip observed at connect. When nothing
+	// has been published yet it stays unanchored, and the loop anchors it to
+	// the source's first ledger instead.
+	if next == 0 {
+		if tip, _, _ := s.b.watch(); tip.seq != 0 {
+			next = uint64(tip.seq) + 1
 		}
 	}
 
-	deliver := func(l liveLedger) (bool, error) {
-		if next != 0 && l.seq < next {
-			return false, nil // already delivered from retention
-		}
-		if err := s.write(ctx, conn, l.msg); err != nil {
-			return false, err
-		}
-		next = l.seq + 1
-		return req.bounded && l.seq >= req.end, nil
-	}
+	// buf is the scratch a ring read is framed into. It grows to the largest
+	// ledger served and is then reused; a subscriber that never falls behind
+	// never allocates it.
+	var buf []byte
 
 	for {
-		// Being dropped outranks everything else that may be ready, including the
-		// source having ended: closing a subscriber we dropped ledgers for with a
-		// normal close would let it mistake a gap for the end of the stream.
-		select {
-		case <-sub.dropped:
-			return wire.StatusSlowConsumer, "subscriber too slow", nil
-		default:
+		tip, changed, ended := s.b.watch()
+		if next == 0 {
+			next = uint64(tip.seq) // the source's first ledger, or still unanchored
+		}
+		if next != 0 && req.bounded && next > uint64(req.end) {
+			return websocket.StatusNormalClosure, "", nil
 		}
 
-		select {
-		case <-ctx.Done():
-			return 0, "", ctx.Err()
-
-		case <-sub.dropped:
-			return wire.StatusSlowConsumer, "subscriber too slow", nil
-
-		case <-s.sourceDone:
-			// Deliver what is already queued, then finish: the source will not
-			// produce more, so waiting is pointless.
-			for {
-				select {
-				case <-sub.dropped:
-					return wire.StatusSlowConsumer, "subscriber too slow", nil
-				default:
+		// Pick the message the cursor calls for: the shared in-memory tip when
+		// the cursor is exactly there (the only copy that carries an emit
+		// stamp), a ring read while behind it, nil when there is nothing to
+		// send yet. Once the source has published, ring reads happen only
+		// below the tip: Put and publish strictly alternate, so the ring's
+		// latest is at most one past the tip, and that one ledger's stamped
+		// publish is already in flight — sleeping on the captured channel
+		// hands it out from memory instead of racing it to disk. Before the
+		// first publish the ring alone decides: after a restart it holds
+		// history the source has not re-published, and that must be served
+		// rather than waited on.
+		var msg []byte
+		if next == uint64(tip.seq) && next != 0 {
+			msg = tip.msg
+		} else if next != 0 && (next < uint64(tip.seq) || tip.seq == 0) {
+			if _, latest, filled := s.store.Bounds(); filled && next <= uint64(latest) {
+				raw, err := s.store.Get(uint32(next))
+				if err != nil {
+					if errors.Is(err, store.ErrNotRetained) {
+						// Off the ring's old edge, whether at connect or
+						// because pruning caught up with the cursor: this
+						// subscriber is too far behind.
+						oldest, l, _ := s.store.Bounds()
+						return wire.StatusTooFarBehind, wire.TooFarBehindReason(oldest, l), nil
+					}
+					return 0, "", err
 				}
-				select {
-				case l := <-sub.ch:
-					complete, err := deliver(l)
-					if err != nil {
-						return 0, "", err
-					}
-					if complete {
-						return websocket.StatusNormalClosure, "", nil
-					}
-				default:
-					// A bounded subscriber still waiting on ledgers is being cut
-					// short, not served. Saying so on the wire keeps the close
-					// honest; the client does not depend on it, because it
-					// compares what arrived against what it asked for.
-					if req.bounded && next <= req.end {
-						return websocket.StatusGoingAway, "source ended before range complete", nil
-					}
-					return websocket.StatusNormalClosure, "source ended", nil
-				}
+				// A ledger served from the ring carries no emit stamp: the
+				// arrival time is not persisted, and the time we read the file
+				// is not a delivery latency.
+				buf = wire.AppendLedger(buf[:0], uint32(next), 0, raw)
+				msg = buf
 			}
+		}
 
-		case l := <-sub.ch:
-			complete, err := deliver(l)
-			if err != nil {
+		if msg != nil {
+			if err := s.write(ctx, conn, msg); err != nil {
 				return 0, "", err
 			}
-			if complete {
-				return websocket.StatusNormalClosure, "", nil
+			next++
+			continue
+		}
+
+		// Nothing to send: caught up, or waiting for the source's first ledger.
+		if ended {
+			// A bounded subscriber still waiting on ledgers is being cut short,
+			// not served. Saying so on the wire keeps the close honest; the
+			// client does not depend on it, because it compares what arrived
+			// against what it asked for.
+			if req.bounded && next <= uint64(req.end) {
+				return websocket.StatusGoingAway, "source ended before range complete", nil
 			}
+			return websocket.StatusNormalClosure, "source ended", nil
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return 0, "", ctx.Err()
 		}
 	}
-}
-
-// closeOutcome is a decided close, so replay can tell "keep going" from "we are
-// finished, close with this code".
-type closeOutcome struct {
-	set    bool
-	code   websocket.StatusCode
-	reason string
-}
-
-// replay sends the retained ledgers the request asks for and advances next past
-// them. It reports an outcome when the subscription is already finished: the
-// start ledger fell off retention, or a bounded range was served entirely from
-// disk.
-func (s *Server) replay(
-	ctx context.Context, conn *websocket.Conn, req streamRequest, next *uint32,
-) (closeOutcome, error) {
-	oldest, latest, filled := s.store.Bounds()
-	if !filled {
-		return closeOutcome{}, nil
-	}
-	if req.start < oldest {
-		return closeOutcome{true, wire.StatusTooFarBehind, wire.TooFarBehindReason(oldest, latest)}, nil
-	}
-	if req.start > latest {
-		return closeOutcome{}, nil // nothing retained yet for this range
-	}
-
-	through := latest
-	if req.bounded && req.end < through {
-		through = req.end
-	}
-	buf := make([]byte, 0, wire.HeaderSize+64<<10)
-	// Breaking after the last sequence instead of testing seq <= through keeps the
-	// loop finite when through is math.MaxUint32, where seq++ would wrap to 0 and
-	// the comparison would never end it.
-	for seq := req.start; ; seq++ {
-		raw, err := s.store.Get(seq)
-		if err != nil {
-			if errors.Is(err, store.ErrNotRetained) {
-				// Pruning caught up with the replay: from here on this
-				// subscriber is too far behind.
-				o, l, _ := s.store.Bounds()
-				return closeOutcome{true, wire.StatusTooFarBehind, wire.TooFarBehindReason(o, l)}, nil
-			}
-			return closeOutcome{}, err
-		}
-		// A replayed ledger carries no emit stamp: the arrival time is not
-		// persisted, and the time we read the file is not a delivery latency.
-		msg := wire.AppendLedger(buf[:0], seq, 0, raw)
-		if err := s.write(ctx, conn, msg); err != nil {
-			return closeOutcome{}, err
-		}
-		*next = seq + 1
-		if seq == through {
-			break
-		}
-	}
-	if req.bounded && *next > req.end {
-		return closeOutcome{true, websocket.StatusNormalClosure, ""}, nil
-	}
-	return closeOutcome{}, nil
 }
 
 func (s *Server) write(ctx context.Context, conn *websocket.Conn, msg []byte) error {
 	wctx, cancel := context.WithTimeout(ctx, writeTimeout)
 	defer cancel()
 	return conn.Write(wctx, websocket.MessageBinary, msg)
-}
-
-// keepalive pings the subscriber while it is idle. A failed ping means the peer
-// is gone; closing the connection unblocks the handler.
-func (s *Server) keepalive(ctx context.Context, conn *websocket.Conn) {
-	ticker := time.NewTicker(s.pingInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			pctx, cancel := context.WithTimeout(ctx, s.pingInterval)
-			err := conn.Ping(pctx)
-			cancel()
-			if err != nil {
-				if ctx.Err() == nil {
-					s.log.Debug("keepalive ping failed", "error", err)
-					conn.CloseNow()
-				}
-				return
-			}
-		}
-	}
 }
 
 // health is the /healthz body.

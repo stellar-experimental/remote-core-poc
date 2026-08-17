@@ -22,15 +22,15 @@ Nothing here modifies the `stellar-rpc` repo. The wiring diff for RPC v2 is writ
  │   │                   ▼    │   WebSocket │    │  (LedgerStream)    │
  │   │            retention   │◄────────────┤    │                   │
  │   ▼            ring (disk) │  ws://…     │    │                   │
- │ broadcaster ──────────────►│─────────────►    │                   │
- │   per-subscriber queue     │  replay,    └────────────────────────┘
+ │ tip watch ────────────────►│─────────────►    │                   │
+ │   (latest ledger + wakeup) │  catch up,  └────────────────────────┘
  │   /healthz                 │  then live
  └────────────────────────────┘
 ```
 
-One goroutine pulls the source and nothing a subscriber does can slow it down: each ledger is copied out of the borrowed iterator slice, appended to the retention ring, and pushed to every subscriber's queue. A subscriber whose queue overflows is disconnected instead of being waited for.
+One goroutine pulls the source and nothing a subscriber does can slow it down: each ledger is copied out of the borrowed iterator slice, appended to the retention ring, and published as the new tip — publishing is a single pointer swap plus a wakeup, so its cost does not grow with the subscriber count.
 
-A subscription is served **replay first, then live**, with no gap and no duplicate: the live queue is registered before the retained bounds are read, the retained ledgers are sent, and live ledgers already covered by the replay are skipped.
+Each subscription is a cursor over the retention ring: **catch up from the ring, then follow the tip**, with no gap and no duplicate. A subscriber behind the tip reads the difference from the ring; one at the tip is handed the shared in-memory message and sleeps until the tip moves. There is no per-subscriber queue to overflow, so a stalled subscriber is never dropped for lagging — it catches back up from the ring by itself, and only falling out of retention entirely ends the stream (close 4001).
 
 ## Wire protocol v1
 
@@ -51,11 +51,10 @@ Close codes:
 | 1000 | The bounded range completed, or an unbounded stream's source ended. |
 | 1001 | The source ended while a bounded subscriber was still waiting for ledgers. |
 | 4001 | `start` is older than retention. The reason carries `oldest=` and `latest=`; the client surfaces `remoteledger.ErrTooFarBehind`. |
-| 4002 | The subscriber fell behind and was dropped; the client surfaces `remoteledger.ErrSlowConsumer`. |
 
 A bounded range that ends short surfaces as `remoteledger.ErrTruncated`, naming the last ledger delivered and the one requested. The client decides that by comparing what arrived against what it asked for, not by trusting the close code — an orderly close from anywhere, including a middlebox, cannot make a short delivery look like a complete one. An unbounded stream has no such expectation, so a clean close simply ends iteration.
 
-The server pings every 15 s. The client accepts a ledger payload of up to 256 MiB, matching the SDK's captive-core frame cap; its WebSocket read limit is that plus the 14-byte header, so the largest ledger is not rejected by its own framing. `remoteledger.WithMaxMessageSize` moves that payload cap.
+The server sends no WebSocket pings: a stalled subscriber could not answer one, and killing it for that would break the catch-up promise. Dead peers are noticed by the OS's TCP keepalive on the read side, or by the server's 2-minute write timeout once a ledger is in flight. The client accepts a ledger payload of up to 256 MiB, matching the SDK's captive-core frame cap; its WebSocket read limit is that plus the 14-byte header, so the largest ledger is not rejected by its own framing. `remoteledger.WithMaxMessageSize` moves that payload cap.
 
 That 256 MiB is the protocol's ceiling, not a setting: `corestreamd` refuses a `--synthetic-size` above it, and its source loop fails with a clear error rather than publishing a ledger no subscriber's read limit would admit. The last representable ledger sequence (`4294967295`) is likewise not streamable — the protocol has no wrap — so both ends refuse a range that reaches it.
 

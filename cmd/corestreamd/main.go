@@ -52,7 +52,6 @@ type options struct {
 	source      string
 	retention   int
 	startLedger uint
-	buffer      int
 	dataDir     string
 	logLevel    string
 
@@ -76,7 +75,6 @@ func parseFlags(out io.Writer, args []string) (options, error) {
 	fs.StringVar(&o.source, "source", "synthetic", "ledger source: captive|synthetic")
 	fs.IntVar(&o.retention, "retention", 10_000, "ledgers to keep on disk for replay")
 	fs.UintVar(&o.startLedger, "start-ledger", 0, "first ledger to stream (required for captive; defaults to 1 for synthetic)")
-	fs.IntVar(&o.buffer, "buffer", server.DefaultSubscriberBuffer, "per-subscriber queue depth before it is disconnected as too slow")
 	fs.StringVar(&o.dataDir, "data-dir", "corestreamd-data", "directory for the retention ring")
 	fs.StringVar(&o.logLevel, "log-level", "info", "log level: debug|info|warn|error")
 
@@ -210,11 +208,10 @@ func run() error {
 	}
 
 	srv, err := server.New(server.Config{
-		Source:           source,
-		Range:            rng,
-		Store:            ring,
-		SubscriberBuffer: o.buffer,
-		Logger:           logger,
+		Source: source,
+		Range:  rng,
+		Store:  ring,
+		Logger: logger,
 	})
 	if err != nil {
 		return err
@@ -223,7 +220,7 @@ func run() error {
 	httpSrv := &http.Server{
 		Handler: srv.Handler(),
 		// A subscription is a long-lived stream, so no read/write timeouts here;
-		// the stream handler bounds its own writes and pings its peer.
+		// the stream handler bounds its own writes.
 		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
 	ln, err := net.Listen("tcp", o.listen)
