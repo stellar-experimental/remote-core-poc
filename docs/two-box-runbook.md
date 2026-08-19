@@ -63,7 +63,7 @@ measured against.
   delta (local captive pays the same ~23 ms serialize + 7.5 ms drain before
   decoding; remote's true penalty is the unhidden wire ≈ 2.2 ms + tail).
   Decide between re-anchoring the gate and building the sized per-chunk
-  compression (~7× on SAC-shape meta at >500 MiB/s; expect less on pubnet
-  meta — re-measure ratio on P3's corpus first).
+  compression (~7× at >500 MiB/s, measured on the acceptance corpus itself —
+  the same SAC-shape meta the gate runs on).
 - If P1 exceeds ~5.5 ms: something outside the model (irq steering, placement,
   clock) — check `chronyc tracking`, `ethtool -S` coalescing, and rerun.
