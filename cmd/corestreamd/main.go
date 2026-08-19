@@ -72,6 +72,7 @@ type options struct {
 	networkPassphrase string
 
 	fileDir   string
+	pipeCmd   string
 	fileCount uint
 
 	syntheticSize     int
@@ -85,7 +86,7 @@ func parseFlags(out io.Writer, args []string) (options, error) {
 	fs := flag.NewFlagSet("corestreamd", flag.ContinueOnError)
 	fs.SetOutput(out)
 	fs.StringVar(&o.listen, "listen", ":8462", "address to serve the stream and /healthz on")
-	fs.StringVar(&o.source, "source", "synthetic", "ledger source: captive|file|synthetic")
+	fs.StringVar(&o.source, "source", "synthetic", "ledger source: captive|file|synthetic|pipe")
 	fs.IntVar(&o.retention, "retention", 10_000, "ledgers to keep on disk for replay")
 	fs.UintVar(&o.startLedger, "start-ledger", 0, "first ledger to stream (required for captive; defaults to 1 otherwise)")
 	fs.StringVar(&o.dataDir, "data-dir", "corestreamd-data", "directory for the retention ring")
@@ -104,6 +105,9 @@ func parseFlags(out io.Writer, args []string) (options, error) {
 	fs.StringVar(&o.networkPassphrase, "network-passphrase", "", "override the NETWORK_PASSPHRASE in the captive-core toml")
 
 	fs.StringVar(&o.fileDir, "file-dir", "", "directory of ledger-<seq>.xdr files to replay (file source)")
+	fs.StringVar(&o.pipeCmd, "pipe-cmd", "",
+		"command run via sh -c with a pipe as child fd 3; each RFC 5531-framed "+
+			"LedgerCloseMeta written there streams as produced - point the child METADATA_OUTPUT_STREAM at fd:3 (pipe source)")
 	fs.UintVar(&o.fileCount, "file-count", 0, "ledgers to emit from the dump (0 = cycle it endlessly)")
 
 	fs.IntVar(&o.syntheticSize, "synthetic-size", server.DefaultSyntheticSize, "synthetic ledger payload bytes")
@@ -116,8 +120,8 @@ func parseFlags(out io.Writer, args []string) (options, error) {
 	if fs.NArg() > 0 {
 		return o, fmt.Errorf("unexpected argument %q", fs.Arg(0))
 	}
-	if o.source != "captive" && o.source != "synthetic" && o.source != "file" {
-		return o, fmt.Errorf("--source must be captive, file or synthetic, got %q", o.source)
+	if o.source != "captive" && o.source != "synthetic" && o.source != "file" && o.source != "pipe" {
+		return o, fmt.Errorf("--source must be captive, file, synthetic or pipe, got %q", o.source)
 	}
 	if uint64(o.startLedger) > math.MaxUint32 {
 		return o, fmt.Errorf("--start-ledger %d does not fit in a ledger sequence", o.startLedger)
@@ -176,6 +180,9 @@ func parseFlags(out io.Writer, args []string) (options, error) {
 	}
 	if o.source == "file" && o.fileDir == "" {
 		return o, errors.New("--file-dir is required with --source file")
+	}
+	if o.source == "pipe" && o.pipeCmd == "" {
+		return o, errors.New("--pipe-cmd is required with --source pipe")
 	}
 	return o, nil
 }
@@ -283,6 +290,12 @@ func run() error {
 			"emit_window", o.emitWindow, "cadence", o.cadence)
 		source = server.PacedSource(fileSource, o.emitWindow, o.cadence)
 		rng = server.CountedRange(start, o.ledgerCount())
+	case "pipe":
+		// The pipe IS the pacer: frames stream as the child writes them, so
+		// no PacedSource — this is the below-the-seam tap the captive case's
+		// comment defers to, with sequences parsed from the metas themselves.
+		source = server.PipeSource(o.pipeCmd)
+		rng = ledgerbackend.UnboundedRange(start)
 	case "captive":
 		storageDir := o.storageDir
 		if storageDir == "" {
