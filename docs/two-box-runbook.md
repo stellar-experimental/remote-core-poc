@@ -60,7 +60,7 @@ measured against.
   must be 0 in every cell.
 - If P1 lands 4–5 ms: the mechanism is working as measured; the gate as
   written is the casualty. The design-relevant criterion is remote-vs-local
-  delta (local captive pays the same ~23 ms serialize + 7.5 ms drain before
+  delta (local captive pays the same ~27 ms serialize + 7.5 ms drain before
   decoding; remote's true penalty is the unhidden wire ≈ 2.2 ms + tail).
   Decide between re-anchoring the gate and building the sized per-chunk
   compression (~7× at >500 MiB/s, measured on the acceptance corpus itself —
