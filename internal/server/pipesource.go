@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +12,7 @@ import (
 	"os/exec"
 
 	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
+	"github.com/stellar/go-stellar-sdk/xdr"
 )
 
 // PipeSource taps a ledger source BELOW the complete-ledger seam: it runs
@@ -25,9 +25,11 @@ import (
 // source (which the SDK seam confines to complete metas at window zero),
 // transfer overlaps core's actual pipe-write burst.
 //
-// The frame's 4-byte record marker supplies Emission.Size up front, and the
-// ledger sequence is parsed from the meta's fixed prefix (see
-// ledgerSeqFromMetaPrefix) — the relay never decodes the rest. The range
+// The frame's record marker (xdr.ReadFrameLength) supplies Emission.Size up
+// front, and the ledger sequence comes from xdr.LedgerCloseMetaView's
+// structural accessor over the meta's first seqPrefixLen bytes — the same
+// no-full-decode path captive core's own consumer uses. The relay never
+// decodes the rest. The range
 // argument is informational: sequences come from the metas themselves, and
 // the stream ends at pipe EOF (the child exiting cleanly ends the range).
 func PipeSource(command string) EmittingStream {
@@ -38,10 +40,12 @@ type pipeStream struct {
 	command string
 }
 
-// seqPrefixLen bounds the bytes needed by ledgerSeqFromMetaPrefix: the walk
-// crosses the meta discriminant, the (optional) close-meta ext, and the
-// ledger header up to ledgerSeq — including a maximal upgrades vector and a
-// signed StellarValue ext, that is well under 2 KiB.
+// seqPrefixLen is how much of each meta is buffered before streaming the
+// rest: enough for the view's walk to reach LedgerHeader.ledgerSeq, which
+// crosses the meta discriminant, the optional close-meta ext, and the header
+// through a maximal upgrades vector and a signed StellarValue ext — well
+// under 2 KiB (pinned by TestPipeSource_SeqPrefixSuffices against real
+// stress-sized core frames).
 const seqPrefixLen = 4096
 
 func (p *pipeStream) Emissions(ctx context.Context, _ ledgerbackend.Range) iter.Seq2[Emission, error] {
@@ -87,10 +91,13 @@ func (p *pipeStream) Emissions(ctx context.Context, _ ledgerbackend.Range) iter.
 		}()
 
 		br := bufio.NewReaderSize(r, 1<<20)
-		var hdr [4]byte
 		prefix := make([]byte, seqPrefixLen)
 		for {
-			if _, err := io.ReadFull(br, hdr[:]); err != nil {
+			// ReadFrameLength enforces the last-fragment bit for us: core
+			// writes each record as one fragment, and anything else is a
+			// framing bug worth failing loudly on.
+			length, err := xdr.ReadFrameLength(br)
+			if err != nil {
 				if errors.Is(err, io.EOF) {
 					// Clean frame boundary: the child finished its range.
 					if werr := wait(); werr != nil && ctx.Err() == nil {
@@ -101,23 +108,16 @@ func (p *pipeStream) Emissions(ctx context.Context, _ ledgerbackend.Range) iter.
 				yield(Emission{}, fmt.Errorf("pipe source: read frame marker: %w", err))
 				return
 			}
-			marker := binary.BigEndian.Uint32(hdr[:])
-			if marker&0x80000000 == 0 {
-				// Core writes each record as a single last-fragment; anything
-				// else is a framing bug worth failing loudly on.
-				yield(Emission{}, fmt.Errorf("pipe source: multi-fragment record (marker %#x)", marker))
-				return
-			}
-			size := int64(marker &^ 0x80000000)
+			size := int64(length)
 
 			n := min(size, seqPrefixLen)
 			if _, err := io.ReadFull(br, prefix[:n]); err != nil {
 				yield(Emission{}, fmt.Errorf("pipe source: read frame prefix: %w", err))
 				return
 			}
-			seq, err := ledgerSeqFromMetaPrefix(prefix[:n])
+			seq, err := xdr.LedgerCloseMetaView(prefix[:n]).LedgerSequence()
 			if err != nil {
-				yield(Emission{}, fmt.Errorf("pipe source: parse ledger seq: %w", err))
+				yield(Emission{}, fmt.Errorf("pipe source: read ledger seq: %w", err))
 				return
 			}
 			body := io.MultiReader(bytes.NewReader(prefix[:n]), &frameTail{r: br, remaining: size - n})
@@ -150,113 +150,3 @@ func (f *frameTail) Read(p []byte) (int, error) {
 	}
 	return n, err
 }
-
-// ledgerSeqFromMetaPrefix walks the fixed-shape prefix of a serialized
-// LedgerCloseMeta (v0/v1/v2) to LedgerHeader.ledgerSeq without decoding the
-// meta: discriminant, close-meta ext (v1+ only), then the header history
-// entry — hash, ledgerVersion, previousLedgerHash, scpValue (txSetHash,
-// closeTime, upgrades vector, basic-or-signed ext), txSetResultHash,
-// bucketListHash, ledgerSeq. Every discriminant on the path is validated so
-// a foreign or corrupt stream errors instead of yielding a garbage sequence.
-func ledgerSeqFromMetaPrefix(b []byte) (uint32, error) {
-	c := xdrCursor{b: b}
-	metaV, err := c.u32()
-	if err != nil {
-		return 0, err
-	}
-	if metaV > 2 {
-		return 0, fmt.Errorf("unknown LedgerCloseMeta version %d", metaV)
-	}
-	if metaV >= 1 {
-		extV, err := c.u32()
-		if err != nil {
-			return 0, err
-		}
-		switch extV {
-		case 0: // void
-		case 1: // ExtensionPoint (u32 0) + sorobanFeeWrite1KB (int64)
-			if err := c.skip(12); err != nil {
-				return 0, err
-			}
-		default:
-			return 0, fmt.Errorf("unknown LedgerCloseMetaExt version %d", extV)
-		}
-	}
-	// LedgerHeaderHistoryEntry.hash, then LedgerHeader up to ledgerSeq.
-	if err := c.skip(32 + 4 + 32 + 32 + 8); err != nil { // hash, ledgerVersion, prevHash, txSetHash, closeTime
-		return 0, err
-	}
-	nUpgrades, err := c.u32()
-	if err != nil {
-		return 0, err
-	}
-	if nUpgrades > 6 {
-		return 0, fmt.Errorf("upgrades vector claims %d entries (max 6)", nUpgrades)
-	}
-	for range nUpgrades {
-		if err := c.skipOpaque(); err != nil {
-			return 0, err
-		}
-	}
-	scpExtV, err := c.u32()
-	if err != nil {
-		return 0, err
-	}
-	switch scpExtV {
-	case 0: // STELLAR_VALUE_BASIC
-	case 1: // STELLAR_VALUE_SIGNED: NodeID (key type + 32B ed25519) + Signature
-		keyType, err := c.u32()
-		if err != nil {
-			return 0, err
-		}
-		if keyType != 0 {
-			return 0, fmt.Errorf("unexpected NodeID key type %d", keyType)
-		}
-		if err := c.skip(32); err != nil {
-			return 0, err
-		}
-		if err := c.skipOpaque(); err != nil {
-			return 0, err
-		}
-	default:
-		return 0, fmt.Errorf("unknown StellarValue ext %d", scpExtV)
-	}
-	if err := c.skip(32 + 32); err != nil { // txSetResultHash, bucketListHash
-		return 0, err
-	}
-	return c.u32()
-}
-
-// xdrCursor is a bounds-checked forward reader over big-endian XDR bytes.
-type xdrCursor struct {
-	b   []byte
-	off int
-}
-
-func (c *xdrCursor) u32() (uint32, error) {
-	if c.off+4 > len(c.b) {
-		return 0, errShortMetaPrefix
-	}
-	v := binary.BigEndian.Uint32(c.b[c.off:])
-	c.off += 4
-	return v, nil
-}
-
-func (c *xdrCursor) skip(n int) error {
-	if c.off+n > len(c.b) {
-		return errShortMetaPrefix
-	}
-	c.off += n
-	return nil
-}
-
-// skipOpaque skips one variable-length opaque: u32 length, data, pad to 4.
-func (c *xdrCursor) skipOpaque() error {
-	n, err := c.u32()
-	if err != nil {
-		return err
-	}
-	return c.skip(int(n+3) &^ 3)
-}
-
-var errShortMetaPrefix = errors.New("meta prefix too short for header walk")

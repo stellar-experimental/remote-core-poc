@@ -71,7 +71,13 @@ func metaFixture(t *testing.T, version int32, seq uint32, signedSCP bool, upgrad
 	return b
 }
 
-func TestLedgerSeqFromMetaPrefix(t *testing.T) {
+// TestPipeSource_SeqPrefixSuffices pins the tap's one structural
+// assumption: seqPrefixLen bytes are always enough for the SDK view to
+// reach LedgerHeader.ledgerSeq, so the rest of a multi-MiB meta can stream
+// without ever being buffered. Covers the shapes that lengthen the walk
+// (signed SCP values, upgrade vectors, the v1 ext) and, when the capture is
+// present, real stress-sized core frames.
+func TestPipeSource_SeqPrefixSuffices(t *testing.T) {
 	cases := []struct {
 		name string
 		meta []byte
@@ -84,7 +90,8 @@ func TestLedgerSeqFromMetaPrefix(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := ledgerSeqFromMetaPrefix(tc.meta)
+			n := min(len(tc.meta), seqPrefixLen)
+			got, err := xdr.LedgerCloseMetaView(tc.meta[:n]).LedgerSequence()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -94,16 +101,38 @@ func TestLedgerSeqFromMetaPrefix(t *testing.T) {
 		})
 	}
 
-	t.Run("short prefix errors", func(t *testing.T) {
-		meta := metaFixture(t, 1, 5, false, 0, false)
-		if _, err := ledgerSeqFromMetaPrefix(meta[:16]); err == nil {
-			t.Fatal("want error on truncated prefix")
+	t.Run("real core frames", func(t *testing.T) {
+		b, err := os.ReadFile("/mnt/nvme/tamir/metaprobe-run/meta-sample.xdr")
+		if err != nil {
+			t.Skip("no real-core capture on this machine")
 		}
-	})
-	t.Run("garbage discriminant errors", func(t *testing.T) {
-		if _, err := ledgerSeqFromMetaPrefix([]byte{0xEE, 0xEE, 0xEE, 0xEE, 0, 0, 0, 0}); err == nil {
-			t.Fatal("want error on unknown meta version")
+		off, frames := 0, 0
+		for off+4 <= len(b) && frames < 20 {
+			size := int(binary.BigEndian.Uint32(b[off:]) &^ 0x80000000)
+			off += 4
+			if off+size > len(b) {
+				break
+			}
+			full := b[off : off+size]
+			n := min(size, seqPrefixLen)
+			prefixSeq, perr := xdr.LedgerCloseMetaView(full[:n]).LedgerSequence()
+			if perr != nil {
+				t.Fatalf("frame %d (%d bytes): prefix walk failed: %v", frames, size, perr)
+			}
+			fullSeq, ferr := xdr.LedgerCloseMetaView(full).LedgerSequence()
+			if ferr != nil {
+				t.Fatal(ferr)
+			}
+			if prefixSeq != fullSeq {
+				t.Fatalf("frame %d: prefix says %d, full meta says %d", frames, prefixSeq, fullSeq)
+			}
+			off += size
+			frames++
 		}
+		if frames == 0 {
+			t.Fatal("capture yielded no complete frames")
+		}
+		t.Logf("%d real frames: prefix walk agrees with full-meta walk", frames)
 	})
 }
 
