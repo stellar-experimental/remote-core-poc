@@ -64,9 +64,19 @@ func (p *pipeStream) Emissions(ctx context.Context, _ ledgerbackend.Range) iter.
 		}
 		// The parent must not hold the write end open, or EOF never arrives.
 		w.Close()
-		// The child is killed by CommandContext on ctx cancel; reap it on
-		// every exit path so a yield-stop cannot leak a zombie.
-		defer func() { _ = cmd.Wait() }()
+		// The child is killed by CommandContext on ctx cancel; reap it
+		// exactly once on every exit path so a yield-stop cannot leak a
+		// zombie and no path ever sees a second Wait's spurious error.
+		var waitErr error
+		waited := false
+		wait := func() error {
+			if !waited {
+				waited = true
+				waitErr = cmd.Wait()
+			}
+			return waitErr
+		}
+		defer func() { _ = wait() }()
 
 		br := bufio.NewReaderSize(r, 1<<20)
 		var hdr [4]byte
@@ -75,7 +85,7 @@ func (p *pipeStream) Emissions(ctx context.Context, _ ledgerbackend.Range) iter.
 			if _, err := io.ReadFull(br, hdr[:]); err != nil {
 				if errors.Is(err, io.EOF) {
 					// Clean frame boundary: the child finished its range.
-					if werr := cmd.Wait(); werr != nil && ctx.Err() == nil {
+					if werr := wait(); werr != nil && ctx.Err() == nil {
 						yield(Emission{}, fmt.Errorf("pipe source: %q exited: %w", p.command, werr))
 					}
 					return

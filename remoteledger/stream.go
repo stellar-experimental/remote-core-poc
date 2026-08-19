@@ -346,7 +346,7 @@ func readMessage(ctx context.Context, conn *websocket.Conn, buf *bytes.Buffer) e
 		return err
 	}
 	if typ != websocket.MessageBinary {
-		return fmt.Errorf("remoteledger: unexpected %v message", typ)
+		return fmt.Errorf("%w: unexpected %v message", ErrProtocol, typ)
 	}
 	buf.Reset()
 	if _, err := buf.ReadFrom(reader); err != nil {
@@ -401,7 +401,7 @@ func (s *Stream) stream(
 		}
 		m, err := wire.Decode(msgBuf.Bytes())
 		if err != nil {
-			yield(nil, fmt.Errorf("remoteledger: %w", err))
+			yield(nil, fmt.Errorf("%w: %w", ErrProtocol, err))
 			return
 		}
 
