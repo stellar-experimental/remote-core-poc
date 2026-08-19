@@ -91,14 +91,23 @@ type Stream struct {
 }
 
 // readLimit is the whole-message ceiling: one chunk plus its header (an END,
-// at wire.EndSize bytes, always fits under it). Saturate rather than wrap: an
-// enormous chunk cap plus the header would overflow to a negative limit,
-// which is how the library spells "no limit at all".
+// at wire.EndSize bytes, always fits under it). A negative cap disables the
+// limit; zero means the default. Saturate rather than wrap: an enormous chunk
+// cap plus the header would overflow to a negative limit, which is how the
+// library spells "no limit at all" — the one thing a huge cap must not
+// silently become.
 func (s *Stream) readLimit() int64 {
-	if s.maxChunkSize > math.MaxInt64-wire.ChunkHeaderSize {
+	n := s.maxChunkSize
+	if n < 0 {
+		return -1 // coder/websocket's "unlimited"
+	}
+	if n == 0 {
+		n = wire.MaxChunkSize
+	}
+	if n > math.MaxInt64-wire.ChunkHeaderSize {
 		return math.MaxInt64
 	}
-	return max(s.maxChunkSize+wire.ChunkHeaderSize, wire.EndSize)
+	return max(n+wire.ChunkHeaderSize, wire.EndSize)
 }
 
 // LedgerInfo is the delivery metadata of one received ledger. It exists because
@@ -192,11 +201,13 @@ func WithMaxMessageSize(n int64) Option {
 
 // WithMaxChunkSize caps a single chunk's payload, in bytes; the WebSocket
 // read limit is this plus the chunk header, which is what keeps the
-// connection's admission at chunk size rather than whole-ledger size. The
-// default is
-// wire.MaxChunkSize, the largest chunk a server flag can configure, so
-// defaults on both ends always interoperate. It must be at least the server's
-// --chunk-size or every ledger's first chunk is rejected as oversized.
+// connection's admission at chunk size rather than whole-ledger size. Zero
+// means the default — wire.MaxChunkSize, the largest chunk a server flag can
+// configure, so defaults on both ends always interoperate — and negative
+// disables the per-message limit entirely, mirroring WithMaxMessageSize (the
+// assembled-ledger cap still applies). A positive cap must be at least the
+// server's --chunk-size or every ledger's first chunk is rejected as
+// oversized.
 func WithMaxChunkSize(n int64) Option {
 	return func(s *Stream) { s.maxChunkSize = n }
 }
@@ -386,6 +397,17 @@ func (s *Stream) stream(
 
 	for {
 		if err := readMessage(ctx, conn, &msgBuf); err != nil {
+			if asm.active {
+				if done, cerr := classifyClose(err, track.expected); done && cerr == nil {
+					// An orderly close in the middle of an announced ledger is
+					// a truncation even on an unbounded range: BEGIN promised a
+					// ledger the close did not deliver, and treating it as a
+					// clean end would make a server crash mid-emission
+					// indistinguishable from shutdown.
+					yield(nil, fmt.Errorf("%w: stream closed mid-assembly of ledger %d", ErrTruncated, asm.seq))
+					return
+				}
+			}
 			finishClose(err, ledgerRange, track.expected, yield)
 			return
 		}

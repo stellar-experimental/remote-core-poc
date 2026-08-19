@@ -27,7 +27,6 @@ import (
 	"math"
 	"net/http"
 	"strconv"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -40,13 +39,15 @@ import (
 )
 
 // chunkWriteTimeout bounds a single message write, and is the server's
-// write-side liveness authority: chunks are small, so a healthy peer drains
-// one far faster than this, and a dead one is noticed within one ledger. A
-// merely slow peer is handled before this fires — its live flow is abandoned
-// in favour of the ring the moment the flow moves past it. There is no
-// WebSocket-level ping: a subscriber stalled mid-iteration cannot pong, and
-// disconnecting it for that would break the promise that only falling out of
-// retention ends a subscription.
+// write-side liveness authority — and a real policy choice: a peer that
+// cannot drain one chunk within it is disconnected mid-write, because a
+// serve loop blocked inside conn.Write cannot observe the flow moving on and
+// fall back to the ring. The catch-up promise therefore holds for peers that
+// keep draining the socket, however slowly they consume; one frozen outright
+// with a chunk in flight is dropped after this bound rather than v1's two
+// minutes. There is no WebSocket-level ping: a subscriber stalled
+// mid-iteration cannot pong, and disconnecting it for that would break the
+// catch-up promise for the peers it does cover.
 const chunkWriteTimeout = 10 * time.Second
 
 // maxPayloadSize is the largest ledger the protocol can carry — the
@@ -87,13 +88,6 @@ type Server struct {
 	log       *slog.Logger
 	chunkSize int
 
-	// ringSums caches each retained ledger's xxhash64, so a ring redelivery
-	// reuses the sum the source loop already computed instead of rehashing
-	// megabytes per catching-up subscriber. Best-effort: history left by a
-	// previous process misses and is hashed on demand.
-	ringSumsMu sync.Mutex
-	ringSums   map[uint32]uint64
-
 	published    atomic.Uint64
 	subscribers  atomic.Int64
 	liveAbandons atomic.Uint64
@@ -118,8 +112,11 @@ func New(cfg Config) (*Server, error) {
 	if chunkSize == 0 {
 		chunkSize = wire.DefaultChunkSize
 	}
-	if chunkSize < 0 {
-		return nil, fmt.Errorf("server: chunk size must be positive, got %d", chunkSize)
+	// The bounds are an interop contract, not a taste check: a chunk over
+	// wire.MaxChunkSize is rejected by every default-configured client's read
+	// limit, disconnecting all of them with an opaque framing error.
+	if err := wire.ValidateChunkSize(chunkSize); err != nil {
+		return nil, fmt.Errorf("server: %w", err)
 	}
 	logger := cfg.Logger
 	if logger == nil {
@@ -132,7 +129,6 @@ func New(cfg Config) (*Server, error) {
 		b:         newBroadcaster(),
 		log:       logger,
 		chunkSize: chunkSize,
-		ringSums:  make(map[uint32]uint64),
 	}, nil
 }
 
@@ -175,11 +171,9 @@ func (s *Server) Run(ctx context.Context) error {
 	s.log.Info("source loop starting", "range", s.rng.String(), "chunk_size", s.chunkSize)
 
 	var assembly []byte // reused across ledgers; the store copies it to disk
-	// spare is the next CHUNK message's allocation, read into directly so a
-	// chunk's bytes are copied once, not staged through an intermediate
-	// buffer — the final chunk's staging copy would sit squarely on the
-	// measured post-emission tail. Once published it belongs to subscribers
-	// and a fresh one is allocated; a read that returns no data hands it back.
+	// spare is a fallback CHUNK message allocation for ledgers whose size the
+	// source did not declare. Once published it belongs to subscribers and a
+	// fresh one is allocated; a read that returns no data hands it back.
 	var spare []byte
 	hasher := xxhash.New()
 
@@ -208,30 +202,65 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 		hasher.Reset()
 
+		// arena holds every chunk message of this ledger in one allocation.
+		// Published messages are immutable and the broadcaster pins the whole
+		// flow until the next BEGIN anyway, so a per-ledger arena preserves
+		// both while collapsing ~58 per-chunk allocations per stress ledger —
+		// GC assists that would land on the measured post-emission tail — into
+		// one. Chunks are carved as disjoint regions; a read's unused slack
+		// beyond n falls inside the NEXT region, which is framed only after
+		// its own read overwrites it, so no published bytes are ever touched.
+		var arena []byte
+		used := 0
+		if em.Size > 0 {
+			headers := (int(em.Size)/s.chunkSize + 2) * wire.ChunkHeaderSize
+			arena = make([]byte, int(em.Size)+headers)
+		}
+
+		// The stamp is the emission's start: the source hands the emission
+		// over as it begins producing, and T_emit, the delivery metric's
+		// anchor, and tip subscriptions all count from here. Publishing BEGIN
+		// before the first read also keeps the stamp honest when that read
+		// blocks for a whole pacing window (the single-chunk case, where
+		// stamping after it would collapse T_emit to ~0 and delivery back to
+		// store-and-forward). A zero-byte ledger keeps BEGIN/END paired.
+		s.b.begin(seq, wire.AppendBegin(make([]byte, 0, wire.BeginSize), seq, time.Now().UnixNano()))
+
 		var chunkIdx uint32
 		for {
-			if spare == nil {
-				spare = make([]byte, wire.ChunkHeaderSize+s.chunkSize)
+			var buf []byte
+			fromArena := len(arena)-used >= wire.ChunkHeaderSize+1
+			if fromArena {
+				buf = arena[used:min(used+wire.ChunkHeaderSize+s.chunkSize, len(arena))]
+			} else {
+				// The size hint ran short (or was absent): standalone
+				// allocations carry the overflow.
+				if spare == nil {
+					spare = make([]byte, wire.ChunkHeaderSize+s.chunkSize)
+				}
+				buf = spare
 			}
-			n, rerr := em.Body.Read(spare[wire.ChunkHeaderSize:])
+			n, rerr := em.Body.Read(buf[wire.ChunkHeaderSize:])
 			if n > 0 {
 				if int64(len(assembly))+int64(n) > maxPayloadSize {
 					return fmt.Errorf("ledger %d ran past the %d-byte protocol payload cap mid-emission",
 						seq, maxPayloadSize)
 				}
-				if chunkIdx == 0 {
-					// The stamp is the first byte's arrival: T_emit and the
-					// whole-pipeline metric both count from here.
-					s.b.begin(seq, wire.AppendBegin(make([]byte, 0, wire.BeginSize), seq, time.Now().UnixNano()))
-				}
-				msg := spare[:wire.ChunkHeaderSize+n]
-				spare = nil
+				msg := buf[:wire.ChunkHeaderSize+n]
 				wire.PutChunkHeader(msg, seq, chunkIdx)
+				// Publish before hashing and assembling: the wire is the
+				// deadline, and both bookkeeping passes only read the message,
+				// so subscribers may share it already.
+				s.b.chunk(msg)
+				chunkIdx++
+				if fromArena {
+					used += wire.ChunkHeaderSize + n
+				} else {
+					spare = nil
+				}
 				data := msg[wire.ChunkHeaderSize:]
 				_, _ = hasher.Write(data) // xxhash's Write cannot fail
 				assembly = append(assembly, data...)
-				s.b.chunk(msg)
-				chunkIdx++
 			}
 			if rerr == io.EOF {
 				break
@@ -244,13 +273,8 @@ func (s *Server) Run(ctx context.Context) error {
 				return fmt.Errorf("source failed emitting ledger %d: %w", seq, rerr)
 			}
 		}
-		if chunkIdx == 0 {
-			// A zero-byte ledger still opens its flow, so BEGIN/END stay paired.
-			s.b.begin(seq, wire.AppendBegin(make([]byte, 0, wire.BeginSize), seq, time.Now().UnixNano()))
-		}
-		sum := hasher.Sum64()
 		s.b.end(wire.AppendEnd(make([]byte, 0, wire.EndSize), seq, chunkIdx,
-			uint64(len(assembly)), time.Now().UnixNano(), sum))
+			uint64(len(assembly)), time.Now().UnixNano(), hasher.Sum64()))
 
 		reset, err := s.store.Put(seq, assembly)
 		if err != nil {
@@ -259,7 +283,6 @@ func (s *Server) Run(ctx context.Context) error {
 		if reset {
 			s.log.Warn("retention reset: ledger does not continue the retained range", "ledger", seq)
 		}
-		s.cacheRingSum(seq, sum, reset)
 
 		s.published.Add(1)
 		if seq%100 == 0 {
@@ -379,30 +402,6 @@ func (s *Server) anchorTip() uint64 {
 	return uint64(snap.seq())
 }
 
-// cacheRingSum records ledger seq's checksum for ring redeliveries, evicting
-// the entry that just left retention. A reset emptied the ring, so it empties
-// the cache: a re-used sequence must never serve a stale sum.
-func (s *Server) cacheRingSum(seq uint32, sum uint64, reset bool) {
-	s.ringSumsMu.Lock()
-	defer s.ringSumsMu.Unlock()
-	if reset {
-		clear(s.ringSums)
-	}
-	s.ringSums[seq] = sum
-	if retention := uint64(s.store.Retention()); uint64(seq) > retention {
-		delete(s.ringSums, uint32(uint64(seq)-retention))
-	}
-}
-
-// ringSum is the cached checksum of retained ledger seq. A miss means the
-// ledger predates this process; the caller hashes it itself.
-func (s *Server) ringSum(seq uint32) (uint64, bool) {
-	s.ringSumsMu.Lock()
-	defer s.ringSumsMu.Unlock()
-	sum, ok := s.ringSums[seq]
-	return sum, ok
-}
-
 // readRing fetches ledger next from the retention ring — the catch-up path of
 // both protocols. ok is false with no error when the ring cannot serve next
 // yet (nothing retained, or next is beyond the retained range): the caller
@@ -447,13 +446,15 @@ func endedClose(req streamRequest, next uint64) (websocket.StatusCode, string) {
 // ledgers it missed are read back from the ring, and only falling out of
 // retention ends the subscription.
 //
-// The slow-subscriber policy lives here too: a subscriber mid-flow when the
+// The slow-subscriber policy lives here too: a subscriber mid-chunks when the
 // flow moves on to the next ledger has spent its budget — the rest of that
 // ledger's emission — so its live flow is abandoned and the ledger is
-// redelivered complete (and stampless) from the ring. The client discards its
-// partial assembly on the fresh BEGIN. The source loop never notices any of
-// this, which is the invariant that keeps one slow consumer from hurting the
-// rest.
+// redelivered complete (and stampless) from the ring; the client discards its
+// partial assembly on the fresh BEGIN. One refinement: a subscriber that had
+// every chunk and was owed only the END is finished from the pinned flow
+// instead — abandoning it would be a spurious fallback charged to a
+// watch-gap, not to slowness. The source loop never notices any of this,
+// which is the invariant that keeps one slow consumer from hurting the rest.
 //
 // It returns the close code to send, or an error when the connection is
 // already broken and a close handshake is pointless.
@@ -470,9 +471,11 @@ func (s *Server) serve(
 	}
 
 	// live tracks progress through the flow the subscriber is mid-way into.
-	// While begun holds, next stays pinned to the begun flow's ledger, so no
-	// separate sequence field is needed to know which flow the progress is in.
+	// While begun holds, next stays pinned to the begun flow's ledger, and f
+	// pins the flow object itself so a flow the broadcaster has moved past can
+	// still be finished from memory.
 	var live struct {
+		f     *flow
 		begun bool // BEGIN written, END not yet
 		sent  int  // chunks written
 	}
@@ -492,6 +495,20 @@ func (s *Server) serve(
 		}
 
 		if next != 0 && next == uint64(snap.seq()) {
+			if !live.begun && snap.complete() {
+				// The subscriber reached this flow only after it finished: the
+				// flow is history to it, not a live delivery, so it is served
+				// from memory with ZEROED stamps — handing a late arrival the
+				// original stamps would record the flow's age (up to a whole
+				// cadence) as a delivery latency and poison the measurement.
+				// The chunk messages themselves are shared; only the tiny
+				// BEGIN/END are re-framed.
+				if err := s.writeStamplessFlow(ctx, conn, snap, &buf); err != nil {
+					return 0, "", err
+				}
+				next++
+				continue
+			}
 			// The live flow: write whatever this snapshot holds beyond what has
 			// already been sent, then re-watch — more may have been published
 			// while these writes were in flight.
@@ -500,7 +517,7 @@ func (s *Server) serve(
 				if err := s.write(ctx, conn, snap.f.begin); err != nil {
 					return 0, "", err
 				}
-				live.begun, live.sent = true, 0
+				live.f, live.begun, live.sent = snap.f, true, 0
 				wrote = true
 			}
 			for live.sent < len(snap.chunks) {
@@ -514,7 +531,7 @@ func (s *Server) serve(
 				if err := s.write(ctx, conn, snap.end); err != nil {
 					return 0, "", err
 				}
-				live.begun = false
+				live.f, live.begun = nil, false
 				next++
 				continue
 			}
@@ -530,11 +547,29 @@ func (s *Server) serve(
 			// has not re-published, and that must be served rather than waited
 			// on.
 			if live.begun {
-				// The flow moved past a ledger this subscriber was still
-				// mid-way through: its live delivery is abandoned, the ring
-				// redelivers it complete. The fresh BEGIN below is what tells
-				// the client to discard its partial.
-				live.begun = false
+				// The flow the subscriber is inside was replaced. The pinned
+				// flow object is complete and safe to read without the lock:
+				// a new flow can only begin after this one's END was published
+				// (begin panics otherwise), and observing the newer flow in
+				// snap ordered that publish before us.
+				if f := live.f; live.sent == len(f.chunks) && f.end != nil {
+					// Only the 34-byte END was outstanding — the subscriber
+					// received every chunk live, so finish the ledger from the
+					// pinned flow with its real stamps instead of charging a
+					// full stampless ring redelivery for a watch-gap that
+					// merely spanned END-publish + disk write + next BEGIN.
+					if err := s.write(ctx, conn, f.end); err != nil {
+						return 0, "", err
+					}
+					live.f, live.begun = nil, false
+					next++
+					continue
+				}
+				// Mid-chunks: the budget — the rest of the ledger's emission —
+				// is spent. Abandon the live delivery; the ring redelivers it
+				// complete, and the fresh BEGIN below is what tells the client
+				// to discard its partial.
+				live.f, live.begun = nil, false
 				s.liveAbandons.Add(1)
 				s.log.Debug("live chunk flow abandoned; redelivering from the ring", "ledger", next)
 			}
@@ -568,6 +603,34 @@ func (s *Server) serve(
 	}
 }
 
+// writeStamplessFlow delivers the retained, completed current flow to a
+// subscriber that reached it only after it finished. The shared in-memory
+// chunk messages go out as they are (chunks carry no stamps), but BEGIN and
+// END are re-framed with both emit stamps zero, so the delivery contributes
+// no latency sample.
+func (s *Server) writeStamplessFlow(
+	ctx context.Context, conn *websocket.Conn, snap flowSnap, buf *[]byte,
+) error {
+	end, err := wire.Decode(snap.end)
+	if err != nil {
+		return fmt.Errorf("re-frame end of ledger %d: %w", snap.seq(), err)
+	}
+	b := *buf
+	defer func() { *buf = b }()
+
+	b = wire.AppendBegin(b[:0], snap.seq(), 0)
+	if err := s.write(ctx, conn, b); err != nil {
+		return err
+	}
+	for _, chunk := range snap.chunks {
+		if err := s.write(ctx, conn, chunk); err != nil {
+			return err
+		}
+	}
+	b = wire.AppendEnd(b[:0], snap.seq(), end.ChunkCount, end.TotalLen, 0, end.Checksum)
+	return s.write(ctx, conn, b)
+}
+
 // writeRingFlow delivers one complete ledger from the retention ring as a
 // chunk flow with both emit stamps zero: the original emission times are not
 // persisted, and a replayed ledger must never contribute a delivery sample.
@@ -590,11 +653,7 @@ func (s *Server) writeRingFlow(
 		}
 		idx++
 	}
-	sum, ok := s.ringSum(seq)
-	if !ok {
-		sum = xxhash.Sum64(raw)
-	}
-	b = wire.AppendEnd(b[:0], seq, idx, uint64(len(raw)), 0, sum)
+	b = wire.AppendEnd(b[:0], seq, idx, uint64(len(raw)), 0, xxhash.Sum64(raw))
 	return s.write(ctx, conn, b)
 }
 

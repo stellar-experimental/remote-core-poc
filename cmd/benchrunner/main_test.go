@@ -23,18 +23,19 @@ func TestParseFlagsDefaults(t *testing.T) {
 
 func TestParseFlagsRejects(t *testing.T) {
 	tests := map[string][]string{
-		"unknown mode":           {"--mode", "carrier-pigeon"},
-		"end before start":       {"--mode", "remote", "--start", "9", "--end", "4"},
-		"zero count in loopback": {"--mode", "loopback", "--count", "0"},
-		"local without start":    {"--mode", "local", "--core-config", "x", "--history-archive-urls", "y"},
-		"local without config":   {"--mode", "local", "--start", "5", "--history-archive-urls", "y"},
-		"local without archives": {"--mode", "local", "--start", "5", "--core-config", "x"},
-		"sequence out of range":  {"--mode", "remote", "--start", "4294967296"},
-		"stray argument":         {"--mode", "remote", "extra"},
-		"unknown flag":           {"--turbo"},
-		"chunk size too small":   {"--chunk-size", "1024"},
-		"chunk size too large":   {"--chunk-size", "16777216"},
-		"negative emit window":   {"--emit-window", "-1ms"},
+		"unknown mode":            {"--mode", "carrier-pigeon"},
+		"end before start":        {"--mode", "remote", "--start", "9", "--end", "4"},
+		"zero count in loopback":  {"--mode", "loopback", "--count", "0"},
+		"local without start":     {"--mode", "local", "--core-config", "x", "--history-archive-urls", "y"},
+		"local without config":    {"--mode", "local", "--start", "5", "--history-archive-urls", "y"},
+		"local without archives":  {"--mode", "local", "--start", "5", "--core-config", "x"},
+		"sequence out of range":   {"--mode", "remote", "--start", "4294967296"},
+		"stray argument":          {"--mode", "remote", "extra"},
+		"unknown flag":            {"--turbo"},
+		"chunk size too small":    {"--chunk-size", "1024"},
+		"chunk size too large":    {"--chunk-size", "16777216"},
+		"negative emit window":    {"--emit-window", "-1ms"},
+		"window outruns interval": {"--emit-window", "20ms", "--synthetic-interval", "10ms"},
 	}
 	for name, args := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -50,8 +51,11 @@ func TestParseFlagsPacingDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseFlags: %v", err)
 	}
-	if o.emitWindow != 15*time.Millisecond {
-		t.Errorf("default emit window = %s, want 15ms", o.emitWindow)
+	if o.emitWindow != 5*time.Millisecond {
+		t.Errorf("default emit window = %s, want 5ms (inside the 10ms interval)", o.emitWindow)
+	}
+	if o.emitWindow > o.syntheticInterval {
+		t.Errorf("default emit window %s does not fit inside the default interval %s", o.emitWindow, o.syntheticInterval)
 	}
 }
 

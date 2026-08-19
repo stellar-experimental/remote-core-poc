@@ -70,7 +70,10 @@ func Open(dir string, retention int) (*Store, error) {
 func (s *Store) rescan() error {
 	seqs, err := ScanLedgerDir(s.dir)
 	if err != nil {
-		return fmt.Errorf("store: %w; delete the directory contents and restart", err)
+		// The scan error carries its own diagnosis (an unreadable directory,
+		// or a gap in the range); claiming "delete the contents" for a
+		// permission error would be wrong advice, so no guidance is appended.
+		return fmt.Errorf("store: %w", err)
 	}
 	if len(seqs) == 0 {
 		return nil

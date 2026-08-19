@@ -137,6 +137,15 @@ func parseFlags(out io.Writer, args []string) (options, error) {
 	if o.cadence < 0 {
 		return o, fmt.Errorf("--cadence %s is negative", o.cadence)
 	}
+	// An emit window longer than the interval between emissions cannot be
+	// honoured: the pacing grid re-anchors and the effective cadence silently
+	// becomes the window, so the run measures a schedule nobody configured.
+	if o.source == "file" && o.cadence > 0 && o.emitWindow > o.cadence {
+		return o, fmt.Errorf("--emit-window %s does not fit inside --cadence %s", o.emitWindow, o.cadence)
+	}
+	if o.source == "synthetic" && o.syntheticInterval > 0 && o.emitWindow > o.syntheticInterval {
+		return o, fmt.Errorf("--emit-window %s does not fit inside --synthetic-interval %s", o.emitWindow, o.syntheticInterval)
+	}
 	// The protocol has no sequence wrap, so the last representable ledger is not
 	// streamable. Refusing a range that reaches it here keeps the retention ring
 	// from ever holding a ledger no subscriber could ask to continue from.
@@ -169,6 +178,32 @@ func parseFlags(out io.Writer, args []string) (options, error) {
 		return o, errors.New("--file-dir is required with --source file")
 	}
 	return o, nil
+}
+
+// validateFileDir refuses a dump directory that is this server's own
+// retention ring: the ring prunes and resets its directory as the source
+// loop publishes, which would permanently destroy the dump mid-replay — and
+// the ring's layout doubling as the dump format makes the mistake an easy
+// one (--file-dir <data-dir>/ledgers with the same --data-dir).
+func validateFileDir(fileDir, dataDir string) error {
+	ringDir := filepath.Join(dataDir, "ledgers")
+	fa, err1 := filepath.Abs(fileDir)
+	ra, err2 := filepath.Abs(ringDir)
+	same := err1 == nil && err2 == nil && fa == ra
+	if !same {
+		// Symlinks can alias what path strings do not; compare identities
+		// when both directories exist.
+		fi, err1 := os.Stat(fileDir)
+		ri, err2 := os.Stat(ringDir)
+		same = err1 == nil && err2 == nil && os.SameFile(fi, ri)
+	}
+	if same {
+		return fmt.Errorf(
+			"--file-dir %q is this server's own retention ring (%s), which prunes and resets its directory; "+
+				"replaying it would destroy the dump — copy it elsewhere or use a different --data-dir",
+			fileDir, ringDir)
+	}
+	return nil
 }
 
 // lastSequence is the highest ledger the configured range is known to reach,
@@ -237,6 +272,9 @@ func run() error {
 			o.emitWindow, o.syntheticInterval)
 		rng = server.CountedRange(start, o.ledgerCount())
 	case "file":
+		if err := validateFileDir(o.fileDir, o.dataDir); err != nil {
+			return err
+		}
 		fileSource, ferr := server.NewFileStream(o.fileDir)
 		if ferr != nil {
 			return ferr

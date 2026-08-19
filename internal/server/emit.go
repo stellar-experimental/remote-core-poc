@@ -83,7 +83,7 @@ func (p *pacedStream) Emissions(ctx context.Context, rng ledgerbackend.Range) it
 					nextStart = now
 				}
 			}
-			body.reset(raw, p.window)
+			body.reset(ctx, raw, p.window)
 			if !yield(Emission{Seq: seq, Size: int64(len(raw)), Body: body}, nil) {
 				return
 			}
@@ -114,19 +114,22 @@ func sleepUntil(ctx context.Context, deadline time.Time) error {
 // until everything it asks for is due, then returns it in full — so a server
 // reading chunk-size pieces sees one chunk per chunk-time, which is exactly
 // the profile the window is standing in for. A zero window releases everything
-// immediately.
+// immediately. Cancelling the context ends a pacing wait early with the
+// context's error — the flags accept windows of minutes, and a SIGINT must
+// not wait one out.
 //
 // The struct is reused across ledgers via reset, so a drained body allocates
 // nothing per ledger.
 type pacedBody struct {
+	ctx     context.Context
 	payload []byte
 	window  time.Duration
 	off     int
 	started time.Time
 }
 
-func (b *pacedBody) reset(payload []byte, window time.Duration) {
-	b.payload, b.window, b.off, b.started = payload, window, 0, time.Time{}
+func (b *pacedBody) reset(ctx context.Context, payload []byte, window time.Duration) {
+	b.ctx, b.payload, b.window, b.off, b.started = ctx, payload, window, 0, time.Time{}
 }
 
 func (b *pacedBody) Read(p []byte) (int, error) {
@@ -140,9 +143,14 @@ func (b *pacedBody) Read(p []byte) (int, error) {
 	if b.window > 0 && n > 0 {
 		// The last byte of this piece is due at window * (off+n)/total, which
 		// puts the payload's final byte due at exactly the window's close.
-		due := b.started.Add(time.Duration(int64(b.window) * int64(b.off+n) / int64(len(b.payload))))
-		if wait := time.Until(due); wait > 0 {
-			time.Sleep(wait)
+		// Float arithmetic on purpose: the integer product overflows int64
+		// for large window×payload combinations (~40s × 256MiB), which would
+		// silently unpace the tail; float64's 53-bit mantissa is exact far
+		// beyond any plausible window.
+		frac := float64(b.off+n) / float64(len(b.payload))
+		due := b.started.Add(time.Duration(float64(b.window) * frac))
+		if err := sleepUntil(b.ctx, due); err != nil {
+			return 0, err
 		}
 	}
 	copy(p, b.payload[b.off:b.off+n])

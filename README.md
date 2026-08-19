@@ -60,7 +60,7 @@ END   [1B ver=0x02][1B type=0x12][4B BE seq][4B BE chunkCount]
 - The checksum is xxhash64 over the raw ledger. The client verifies it on END — along with `totalLen` and `chunkCount` against what actually arrived — before handing the meta up. Violations are protocol errors that end the stream (`remoteledger.ErrProtocol`), never silent drops.
 - A fresh BEGIN for the sequence currently being assembled is the one legal mid-flow BEGIN: it announces a ring redelivery, and the client discards its partial.
 
-The 256 MiB per-ledger cap is an **assembly-buffer cap** (`remoteledger.WithMaxMessageSize`), matching the SDK's captive-core frame cap; the per-message WebSocket read limit is just one chunk plus its header (`remoteledger.WithMaxChunkSize`, default 8 MiB — the largest chunk a server flag can configure, so defaults on both ends always interoperate). The server bounds each message write at 10 seconds.
+The 256 MiB per-ledger cap is an **assembly-buffer cap** (`remoteledger.WithMaxMessageSize`), matching the SDK's captive-core frame cap; the per-message WebSocket read limit is just one chunk plus its header (`remoteledger.WithMaxChunkSize`, default 8 MiB — the largest chunk a server flag can configure, so defaults on both ends always interoperate). The server bounds each message write at 10 seconds — a real policy edge: a peer that keeps draining the socket, however slowly, is never dropped, but one frozen outright with a chunk in flight is disconnected after that bound, because a serve loop blocked mid-write cannot fall back to the ring.
 
 TCP/WS hygiene, since this is where the milliseconds hide: TCP_NODELAY is on (Go's default for TCP connections, on both ends), WebSocket permessage-deflate is explicitly disabled on both ends, and every chunk is written the moment it exists. Socket buffer sizing is left to the OS's autotuning, which keeps a few chunks in flight on any modern kernel.
 
@@ -74,7 +74,7 @@ Close codes:
 
 A bounded range that ends short surfaces as `remoteledger.ErrTruncated`, naming the last ledger delivered and the one requested. The client decides that by comparing what arrived against what it asked for, not by trusting the close code — an orderly close from anywhere, including a middlebox, cannot make a short delivery look like a complete one. An unbounded stream has no such expectation, so a clean close simply ends iteration.
 
-The server sends no WebSocket pings: a stalled subscriber could not answer one, and killing it for that would break the catch-up promise. Dead peers are noticed by the OS's TCP keepalive on the read side, or by the per-message write timeout once chunks are in flight.
+The server sends no WebSocket pings: a stalled subscriber could not answer one, and killing it for that would break the catch-up promise for peers that are merely slow. Dead peers are noticed by the OS's TCP keepalive on the read side, or by the 10-second per-message write timeout once chunks are in flight.
 
 The 256 MiB ledger cap is the protocol's ceiling, not a setting: `corestreamd` refuses a `--synthetic-size` above it, and its source loop fails with a clear error rather than emitting a ledger no subscriber would admit. The last representable ledger sequence (`4294967295`) is likewise not streamable — the protocol has no wrap — so both ends refuse a range that reaches it.
 
@@ -191,6 +191,8 @@ Read the runs together: `local` says how fast ledgers can be produced at all, `r
 | `docs/rpc-wiring.md` | The exact diff to wire this into stellar-rpc v2. |
 
 ## Prototype boundaries
+
+The retention ring has no run identity: after a restart over a stale `--data-dir`, ledgers the previous run retained are served as history until the new source's first publish resets the ring — a subscriber connecting in that window can receive the old run's bytes spliced with the new run's, checksum-clean on both sides. Clear the data dir (or use a fresh one) when changing sources or start ledgers.
 
 Deliberately absent: **compression** (the documented option for small-NIC receivers, where the wire time exceeds the emission window; its codec adds ~2–6 ms of tail, strictly worse on c6id-class NICs), TLS and auth (plaintext), gRPC (WebSocket was chosen to avoid a protoc/buf toolchain on every box; a gRPC variant is a follow-up if WebSocket framing shows up in the numbers), Prometheus metrics on the server (structured logs and `/healthz` instead), any parsing of ledger bodies (the seam carries opaque bytes end to end), verbatim-frame-reuse coupling with RPC storage, multi-subscriber scale-out beyond keeping the source-loop invariants, and multi-node retention replication.
 

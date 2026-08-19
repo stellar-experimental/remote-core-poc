@@ -81,6 +81,33 @@ func TestParseFlagsPacingAndChunkBounds(t *testing.T) {
 	if _, err := parseFlags(io.Discard, []string{"--chunk-size", "65536", "--emit-window", "0", "--cadence", "0"}); err != nil {
 		t.Errorf("valid pacing flags were rejected: %v", err)
 	}
+
+	// A window that outruns the schedule silently rewrites the cadence, so it
+	// is refused for the sources the window applies to.
+	for name, args := range map[string][]string{
+		"file window outruns cadence":       {"--source", "file", "--file-dir", "d", "--emit-window", "1s", "--cadence", "600ms"},
+		"synthetic window outruns interval": {"--emit-window", "2s", "--synthetic-interval", "1s"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseFlags(io.Discard, args); err == nil {
+				t.Errorf("parseFlags(%v) succeeded, want an error", args)
+			}
+		})
+	}
+}
+
+func TestValidateFileDirRefusesTheRetentionRing(t *testing.T) {
+	// Replaying the server's own ring would let Put's reset and pruning delete
+	// the dump mid-replay: permanent data loss behind a plausible flag pairing.
+	if err := validateFileDir("corestreamd-data/ledgers", "corestreamd-data"); err == nil {
+		t.Error("the retention ring was accepted as a dump directory")
+	}
+	if err := validateFileDir("./corestreamd-data/ledgers", "corestreamd-data"); err == nil {
+		t.Error("a differently spelled path to the ring was accepted")
+	}
+	if err := validateFileDir("/data/sac-6000", "corestreamd-data"); err != nil {
+		t.Errorf("an unrelated dump directory was refused: %v", err)
+	}
 }
 
 func TestParseFlagsCaptiveRequirements(t *testing.T) {

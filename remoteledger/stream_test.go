@@ -307,8 +307,31 @@ func TestRawLedgersTruncatedMidAssembly(t *testing.T) {
 	if r.count != 1 {
 		t.Errorf("received %d ledgers, want the 1 complete one", r.count)
 	}
-	if !strings.Contains(r.err.Error(), "got through ledger 1") {
-		t.Errorf("error %v does not name the last complete ledger", r.err)
+	if !strings.Contains(r.err.Error(), "mid-assembly of ledger 2") {
+		t.Errorf("error %v does not name the ledger cut short", r.err)
+	}
+}
+
+func TestRawLedgersUnboundedCloseMidAssemblyIsAnError(t *testing.T) {
+	// The RPC live-ingest shape: an unbounded range, where a clean close is
+	// normally just the end. Mid-assembly it is not — BEGIN announced a ledger
+	// the close did not deliver, and a server crash mid-emission sends exactly
+	// this orderly close. Silence here would vanish the ledger.
+	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
+		sendFlow(ctx, conn, 1, 0, 0, []byte("whole"))
+		send(ctx, conn, wire.AppendBegin(nil, 2, 0))
+		send(ctx, conn, wire.AppendChunk(nil, 2, 0, []byte("partial")))
+		_ = conn.Close(websocket.StatusNormalClosure, "source ended")
+	})
+	r := drain(t.Context(), New(url), ledgerbackend.UnboundedRange(1))
+	if !errors.Is(r.err, ErrTruncated) {
+		t.Fatalf("error = %v, want ErrTruncated", r.err)
+	}
+	if r.count != 1 {
+		t.Errorf("received %d ledgers, want the 1 complete one", r.count)
+	}
+	if !strings.Contains(r.err.Error(), "mid-assembly of ledger 2") {
+		t.Errorf("error %v does not name the ledger cut short", r.err)
 	}
 }
 
@@ -650,10 +673,14 @@ func TestReadLimitIsChunkSized(t *testing.T) {
 	if got := New("ws://box", WithMaxChunkSize(64<<10)).readLimit(); got != 64<<10+wire.ChunkHeaderSize {
 		t.Errorf("read limit for a 64 KiB chunk cap = %d, want %d", got, 64<<10+wire.ChunkHeaderSize)
 	}
-	// However small the chunk cap, an END message must still be admitted, or
-	// every flow would die at its last message.
-	if got := New("ws://box", WithMaxChunkSize(0)).readLimit(); got < wire.EndSize {
-		t.Errorf("read limit for a zero chunk cap = %d, cannot admit an END (%d bytes)", got, wire.EndSize)
+	// Zero means the default, not a 34-byte connection.
+	if got, want := New("ws://box", WithMaxChunkSize(0)).readLimit(), int64(wire.MaxChunkSize+wire.ChunkHeaderSize); got != want {
+		t.Errorf("read limit for a zero chunk cap = %d, want the default %d", got, want)
+	}
+	// Negative disables the limit, mirroring WithMaxMessageSize — it must not
+	// collapse to a tiny cap that rejects every real chunk.
+	if got := New("ws://box", WithMaxChunkSize(-1)).readLimit(); got != -1 {
+		t.Errorf("read limit for a negative chunk cap = %d, want -1 (no limit)", got)
 	}
 	// An enormous cap must saturate, not wrap to a negative limit — negative
 	// is how the library spells "no limit at all".

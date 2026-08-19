@@ -117,6 +117,40 @@ func TestPacedSourceForwardsSourceErrors(t *testing.T) {
 	}
 }
 
+func TestPacedBodyCancelledMidWindow(t *testing.T) {
+	// The flags accept emission windows of minutes; a SIGINT must interrupt a
+	// pacing wait, not sit it out. Cancellation surfaces as the body's read
+	// error, which is how Run notices it mid-emission.
+	src := PacedSource(NewSyntheticStream(SyntheticConfig{Size: 64 << 10}), time.Hour, 0)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	start := time.Now()
+	var got error
+	for em, err := range src.Emissions(ctx, ledgerbackend.BoundedRange(1, 1)) {
+		if err != nil {
+			t.Fatalf("emission: %v", err)
+		}
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			cancel()
+		}()
+		buf := make([]byte, 8<<10)
+		for {
+			if _, rerr := em.Body.Read(buf); rerr != nil {
+				got = rerr
+				break
+			}
+		}
+	}
+	if !errors.Is(got, context.Canceled) {
+		t.Fatalf("read error = %v, want context.Canceled", got)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("cancellation took %s to interrupt an hour-long window", elapsed)
+	}
+}
+
 func TestPacedSourceCancelledMidCadenceWait(t *testing.T) {
 	src := PacedSource(NewSyntheticStream(SyntheticConfig{Size: 512}), 0, time.Hour)
 	ctx, cancel := context.WithCancel(t.Context())

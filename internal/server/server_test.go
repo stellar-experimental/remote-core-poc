@@ -20,6 +20,7 @@ import (
 	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
 
 	"github.com/stellar-experimental/remote-core-poc/internal/store"
+	"github.com/stellar-experimental/remote-core-poc/internal/wire"
 	"github.com/stellar-experimental/remote-core-poc/remoteledger"
 )
 
@@ -133,6 +134,15 @@ func TestNewValidation(t *testing.T) {
 	}
 	if _, err := New(Config{Source: src, Range: ledgerbackend.UnboundedRange(0), Store: ring}); err == nil {
 		t.Error("New with a zero start ledger succeeded, want an error")
+	}
+
+	// The chunk-size bounds are an interop contract with every client's read
+	// limit, so they bind library embedders, not just the CLI flag parsers.
+	for _, bad := range []int{1024, wire.MaxChunkSize + 1} {
+		cfg := Config{Source: src, Range: ledgerbackend.UnboundedRange(1), Store: ring, ChunkSize: bad}
+		if _, err := New(cfg); err == nil {
+			t.Errorf("New accepted chunk size %d, outside the protocol bounds", bad)
+		}
 	}
 }
 
@@ -458,10 +468,12 @@ func TestStalledSubscriberFallingOutOfRetentionIsTooFarBehind(t *testing.T) {
 }
 
 func TestManySubscribersShareTheStream(t *testing.T) {
-	// Every subscriber's write hands out the same tip.msg backing array, and
-	// the race detector only sees that sharing when many goroutines do it at
-	// once. Payload equality is the corruption check.
-	h := startHarness(t, harnessOpts{count: 50, size: 4 << 10, interval: time.Millisecond})
+	// Every subscriber shares the flow's chunk messages, and the race detector
+	// only sees that sharing when many goroutines do it at once. Payload
+	// equality is the corruption check. The emit window keeps flows open long
+	// enough that subscribers reliably join some of them mid-emission — the
+	// stamped live path — as well as after completion (the stampless path).
+	h := startHarness(t, harnessOpts{count: 50, size: 4 << 10, interval: time.Millisecond, emitWindow: 2 * time.Millisecond})
 
 	const subscribers = 8
 	results := make(chan *consumer, subscribers)
@@ -514,6 +526,34 @@ func TestLargeLedgerRoundTrips(t *testing.T) {
 		if !bytes.Equal(c.payloads[i], h.payload(seq)) {
 			t.Errorf("ledger %d payload does not match what the source produced", seq)
 		}
+	}
+}
+
+func TestCompletedFlowServedToLateArrivalIsStampless(t *testing.T) {
+	// The current flow is retained in memory after it completes. A subscriber
+	// that reaches it only then — the README's own "bound the range just
+	// ahead of latest" methodology produces exactly this — was not following
+	// live, so handing it the flow's original stamps would record the flow's
+	// age (up to a whole cadence) as a delivery latency. It must arrive
+	// stampless, like any other redelivery of history.
+	h := startHarness(t, harnessOpts{count: 5})
+	if err := h.wait(t); err != nil {
+		t.Fatalf("source loop: %v", err)
+	}
+
+	c := consume(t.Context(), t, h.url, ledgerbackend.BoundedRange(5, 5), 0, nil)
+	if c.err != nil {
+		t.Fatalf("stream error: %v", c.err)
+	}
+	wantContiguous(t, c.seqs, 5, 5)
+	if !bytes.Equal(c.payloads[0], h.payload(5)) {
+		t.Error("the stampless redelivery does not match what the source produced")
+	}
+	if c.stamps[0] != 0 {
+		t.Errorf("ledger 5 arrived with emit stamp %d; a post-completion arrival must be stampless", c.stamps[0])
+	}
+	if _, ok := c.infos[0].Delivery(); ok {
+		t.Error("a post-completion arrival contributed a delivery sample")
 	}
 }
 
