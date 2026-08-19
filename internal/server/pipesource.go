@@ -76,7 +76,15 @@ func (p *pipeStream) Emissions(ctx context.Context, _ ledgerbackend.Range) iter.
 			}
 			return waitErr
 		}
-		defer func() { _ = wait() }()
+		// Close the read end BEFORE waiting: on an early stop (consumer quit
+		// mid-frame, ctx intact) the child may be blocked writing into the
+		// full pipe — closing our end turns its next write into EPIPE so it
+		// exits and Wait returns, instead of deadlocking shutdown. The outer
+		// r.Close is then a harmless double-close.
+		defer func() {
+			_ = r.Close()
+			_ = wait()
+		}()
 
 		br := bufio.NewReaderSize(r, 1<<20)
 		var hdr [4]byte
@@ -112,12 +120,35 @@ func (p *pipeStream) Emissions(ctx context.Context, _ ledgerbackend.Range) iter.
 				yield(Emission{}, fmt.Errorf("pipe source: parse ledger seq: %w", err))
 				return
 			}
-			body := io.MultiReader(bytes.NewReader(prefix[:n]), io.LimitReader(br, size-n))
+			body := io.MultiReader(bytes.NewReader(prefix[:n]), &frameTail{r: br, remaining: size - n})
 			if !yield(Emission{Seq: seq, Size: size, Body: body}, nil) {
 				return
 			}
 		}
 	}
+}
+
+// frameTail serves the frame bytes past the parsed prefix, converting an
+// EOF before the marker-declared length into a loud ErrUnexpectedEOF — a
+// child dying mid-frame must never read as a clean, shorter ledger.
+type frameTail struct {
+	r         *bufio.Reader
+	remaining int64
+}
+
+func (f *frameTail) Read(p []byte) (int, error) {
+	if f.remaining == 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > f.remaining {
+		p = p[:f.remaining]
+	}
+	n, err := f.r.Read(p)
+	f.remaining -= int64(n)
+	if errors.Is(err, io.EOF) && f.remaining > 0 {
+		err = fmt.Errorf("pipe source: frame truncated %d bytes short: %w", f.remaining, io.ErrUnexpectedEOF)
+	}
+	return n, err
 }
 
 // ledgerSeqFromMetaPrefix walks the fixed-shape prefix of a serialized

@@ -273,6 +273,13 @@ func (s *Server) Run(ctx context.Context) error {
 				return fmt.Errorf("source failed emitting ledger %d: %w", seq, rerr)
 			}
 		}
+		// A source that declared a size must deliver exactly it: publishing a
+		// truncated body under a fresh checksum would turn a mid-frame source
+		// failure into a valid-looking shorter ledger.
+		if em.Size > 0 && int64(len(assembly)) != em.Size {
+			return fmt.Errorf("ledger %d body is %d bytes, source declared %d",
+				seq, len(assembly), em.Size)
+		}
 		s.b.end(wire.AppendEnd(make([]byte, 0, wire.EndSize), seq, chunkIdx,
 			uint64(len(assembly)), time.Now().UnixNano(), hasher.Sum64()))
 

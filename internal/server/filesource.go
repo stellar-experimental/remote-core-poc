@@ -100,6 +100,10 @@ func readInto(buf []byte, path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if info.Size() > maxPayloadSize {
+		return nil, fmt.Errorf("ledger file %s is %d bytes, over the %d-byte protocol payload cap",
+			fh.Name(), info.Size(), maxPayloadSize)
+	}
 	size := int(info.Size())
 	if cap(buf) < size {
 		buf = make([]byte, size)

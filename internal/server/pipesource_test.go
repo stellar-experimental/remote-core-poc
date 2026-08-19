@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -172,4 +173,34 @@ func TestPipeSource_ChildFailureSurfaces(t *testing.T) {
 	if !sawErr {
 		t.Fatal("want the child's exit status surfaced as an error")
 	}
+}
+
+// TestPipeSource_TruncatedFrameSurfaces pins the integrity contract: a child
+// dying mid-frame must surface ErrUnexpectedEOF from the Body, never a clean
+// EOF that would let a truncated ledger publish as a valid shorter one.
+func TestPipeSource_TruncatedFrameSurfaces(t *testing.T) {
+	meta := metaFixture(t, 1, 55, false, 0, false)
+	// Pad past the seq-parse prefix so the truncation lands in the body
+	// tail (a shortfall inside the prefix read errors at emission level —
+	// also loud, but a different path).
+	padded := append(append([]byte{}, meta...), make([]byte, seqPrefixLen)...)
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(padded)+4096)|0x80000000) // declare more than exists
+	stream := append(hdr[:], padded...)
+	path := filepath.Join(t.TempDir(), "truncated.bin")
+	if err := os.WriteFile(path, stream, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src := PipeSource(fmt.Sprintf("cat %s >&3", path))
+	for em, err := range src.Emissions(context.Background(), CountedRange(1, 0)) {
+		if err != nil {
+			t.Fatalf("emission-level error before body read: %v", err)
+		}
+		_, rerr := io.ReadAll(em.Body)
+		if !errors.Is(rerr, io.ErrUnexpectedEOF) {
+			t.Fatalf("body read error = %v, want ErrUnexpectedEOF", rerr)
+		}
+		return
+	}
+	t.Fatal("no emission yielded")
 }
