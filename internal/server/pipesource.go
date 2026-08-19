@@ -10,6 +10,8 @@ import (
 	"iter"
 	"os"
 	"os/exec"
+	"syscall"
+	"time"
 
 	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
 	"github.com/stellar/go-stellar-sdk/xdr"
@@ -61,6 +63,16 @@ func (p *pipeStream) Emissions(ctx context.Context, _ ledgerbackend.Range) iter.
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		cmd.ExtraFiles = []*os.File{w} // fd 3 in the child
+		// The command is arbitrary shell, so sh may fork rather than exec:
+		// killing sh alone would leave a grandchild holding fd 3, the pipe
+		// would never reach EOF, and shutdown would hang forever. Give the
+		// child its own process group and signal the GROUP, then bound the
+		// wait so a process ignoring SIGTERM cannot stall the daemon.
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.Cancel = func() error {
+			return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+		}
+		cmd.WaitDelay = 5 * time.Second
 		if err := cmd.Start(); err != nil {
 			w.Close()
 			yield(Emission{}, fmt.Errorf("pipe source: start %q: %w", p.command, err))
@@ -87,6 +99,12 @@ func (p *pipeStream) Emissions(ctx context.Context, _ ledgerbackend.Range) iter.
 		// r.Close is then a harmless double-close.
 		defer func() {
 			_ = r.Close()
+			if cmd.Process != nil && ctx.Err() == nil {
+				// An early stop with the context still live gets no Cancel
+				// from CommandContext; tear the group down ourselves so no
+				// grandchild survives holding the pipe.
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+			}
 			_ = wait()
 		}()
 
@@ -105,6 +123,9 @@ func (p *pipeStream) Emissions(ctx context.Context, _ ledgerbackend.Range) iter.
 					}
 					return
 				}
+				if ctx.Err() != nil {
+					return // shutdown mid-stream: the partial frame is expected
+				}
 				yield(Emission{}, fmt.Errorf("pipe source: read frame marker: %w", err))
 				return
 			}
@@ -112,6 +133,9 @@ func (p *pipeStream) Emissions(ctx context.Context, _ ledgerbackend.Range) iter.
 
 			n := min(size, seqPrefixLen)
 			if _, err := io.ReadFull(br, prefix[:n]); err != nil {
+				if ctx.Err() != nil {
+					return // shutdown mid-frame
+				}
 				yield(Emission{}, fmt.Errorf("pipe source: read frame prefix: %w", err))
 				return
 			}

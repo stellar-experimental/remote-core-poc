@@ -116,7 +116,7 @@ The client streams until you interrupt it, since `--start 1` with no `--end` is 
 
 `--source file` replays a directory of `ledger-<seq>.xdr` files — the exact layout the retention ring writes, so **any previous run's `<data-dir>/ledgers` is a dump** (capture one from real core with `--source captive`, or use the sac-6000 dump from the issue-906 rerun laid out one file per ledger). Records are renumbered from `--start-ledger` and cycled endlessly (`--file-count` bounds the replay), which is what lets a fixed dump stand in for an endless source in a long run.
 
-The replayer emits **incrementally**: each ledger's bytes are paced over `--emit-window` (default 15 ms — the disk-read proxy measured in the issue-906 rerun), one ledger every `--cadence` (default 600 ms). This is what makes the overlap measurable at all; a replayer that reads a whole record and then sends it has finished "emitting" before the first byte moves and can only ever measure store-and-forward.
+The replayer emits **incrementally**: each ledger's bytes are paced over `--emit-window` (default 15 ms; **pace real-core cells at 7500us**, the emission window measured against stellar-core — the 15 ms default is the older disk-read proxy), one ledger every `--cadence` (default 600 ms). This is what makes the overlap measurable at all; a replayer that reads a whole record and then sends it has finished "emitting" before the first byte moves and can only ever measure store-and-forward.
 
 The acceptance environment is two instances with ≥12.5 Gbps **baseline** NICs (c6id.8xlarge or equivalent — m6id.2xlarge is 3.125 Gbps baseline and must not be the receiver), same AZ, NTP verified on both ends:
 
@@ -133,7 +133,7 @@ go run ./cmd/benchrunner --mode remote --url ws://core-box:8462 --csv chunked.cs
 git checkout 7d74d10 && go run ./cmd/corestreamd ... && go run ./cmd/benchrunner ... --csv baseline.csv
 ```
 
-Gates at emit-window 15 ms: delivery p50 ≤ 1.5 ms, **p99 ≤ 4 ms**, max ≤ 10 ms; zero checksum failures; zero fallbacks. Also report sensitivity rows at `--emit-window 10ms` and `5ms` (no gate — at 5 ms roughly `(9.7−5)+1 ≈ 6 ms` should poke out, which is the row that bounds what core's real emission profile can promise). If a gate misses, decompose the tail from the CSV (`emit_ns`, `delivery_ns`, `pipeline_ns` per ledger) before changing the design.
+Gate at the **measured** core window (`--emit-window 7500us`, see below): **delivery p99 ≤ 4 ms**, zero checksum failures, zero fallbacks — expect p50 ~2.5–3.5 ms, since at that window ~2.2 ms of a 14.5 MiB transfer no longer hides inside emission. `docs/two-box-runbook.md` is the authority on the cells and their expected bands. Sensitivity rows at `--emit-window 15ms` (the old assumption: sub-millisecond, everything hides) and `5ms` (roughly `(9.7−5)+1 ≈ 6 ms` pokes out) bracket what core's emission profile can promise. If a gate misses, decompose the tail from the CSV (`emit_ns`, `delivery_ns`, `pipeline_ns` per ledger) before changing the design.
 
 ## Run against real captive core
 
@@ -153,7 +153,7 @@ go run ./cmd/corestreamd \
 
 `--start-ledger` is required in captive mode: resolving "the tip" needs a history-archive round trip this prototype does not do, and a benchmark replays a known range anyway. Use `--network-passphrase` to override what the toml declares (the SDK rejects a disagreement, so a wrong value fails loudly rather than starting core on the wrong network).
 
-Captive mode ignores `--emit-window` and `--cadence`: core paces itself, and the SDK seam only surfaces **complete** metas, so each one is chunk-forwarded the moment the seam yields it — overlap with core's real emission needs a tap below that seam (the meta pipe), which is future work. When that tap exists, instrument first-byte/last-byte per ledger first: that single `t_emit` distribution bounds everything this design can promise in production.
+Captive mode ignores `--emit-window` and `--cadence`: core paces itself, and the SDK seam only surfaces **complete** metas, so each one is chunk-forwarded the moment the seam yields it — overlap with core's real emission needs a tap below that seam (the meta pipe) — that tap **ships here** as `--source pipe --pipe-cmd "..."`, which runs the command with a pipe as its fd 3 and streams each framed meta as core writes it. Its first-byte/last-byte distribution was measured before anything else: p50 7.47 ms per 14.5 MiB stress ledger, which is what bounds everything this design can promise in production.
 
 ## Benchmark
 

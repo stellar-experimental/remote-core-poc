@@ -53,6 +53,7 @@ type broadcaster struct {
 	cur    *flow         // nil until the first begin
 	notify chan struct{} // closed on every publish, and once more by finish
 	ended  bool          // the flow is final; nothing may follow
+	srcErr error         // the source failure finish recorded, if any
 }
 
 func newBroadcaster() *broadcaster {
@@ -102,14 +103,25 @@ func (b *broadcaster) end(endMsg []byte) {
 	b.wakeLocked()
 }
 
-// finish marks the stream final and wakes every watcher one last time.
-func (b *broadcaster) finish() {
+// finish marks the stream final and wakes every watcher one last time. A
+// non-nil srcErr is the source's failure: subscribers must be able to tell
+// "the source finished" from "the source broke", or an unbounded consumer
+// ends its iteration with a nil error and silently stops ingesting.
+func (b *broadcaster) finish(srcErr error) {
 	b.mu.Lock()
 	if !b.ended {
 		b.ended = true
+		b.srcErr = srcErr
 		close(b.notify)
 	}
 	b.mu.Unlock()
+}
+
+// failure reports the source failure recorded by finish, once ended.
+func (b *broadcaster) failure() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.srcErr
 }
 
 func (b *broadcaster) wakeLocked() {

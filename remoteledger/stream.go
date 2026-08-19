@@ -104,8 +104,11 @@ func (s *Stream) readLimit() int64 {
 	if n == 0 {
 		n = wire.MaxChunkSize
 	}
-	if n > math.MaxInt64-wire.ChunkHeaderSize {
-		return math.MaxInt64
+	if n > math.MaxInt64-wire.ChunkHeaderSize-1 {
+		// Saturate BELOW MaxInt64: coder/websocket increments whatever it is
+		// given, so MaxInt64 wraps negative and it treats that as unlimited —
+		// the exact outcome this cap exists to prevent.
+		return math.MaxInt64 - 1
 	}
 	return max(n+wire.ChunkHeaderSize, wire.EndSize)
 }

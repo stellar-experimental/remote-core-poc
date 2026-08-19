@@ -682,10 +682,16 @@ func TestReadLimitIsChunkSized(t *testing.T) {
 	if got := New("ws://box", WithMaxChunkSize(-1)).readLimit(); got != -1 {
 		t.Errorf("read limit for a negative chunk cap = %d, want -1 (no limit)", got)
 	}
-	// An enormous cap must saturate, not wrap to a negative limit — negative
-	// is how the library spells "no limit at all".
-	if got := New("ws://box", WithMaxChunkSize(math.MaxInt64)).readLimit(); got != math.MaxInt64 {
-		t.Errorf("read limit for the int64 ceiling = %d, want it saturated at MaxInt64", got)
+	// An enormous cap must saturate BELOW MaxInt64 and stay a real limit.
+	// coder/websocket increments whatever it is handed, so MaxInt64 wraps to
+	// MinInt64 and its reader reads a negative limit as "unlimited" — the cap
+	// would silently disappear and one hostile message could OOM the client.
+	got := New("ws://box", WithMaxChunkSize(math.MaxInt64)).readLimit()
+	if got <= 0 {
+		t.Errorf("read limit for the int64 ceiling = %d, want a positive limit", got)
+	}
+	if got+1 <= 0 {
+		t.Errorf("read limit %d wraps negative once the library increments it — that is 'no limit'", got)
 	}
 }
 

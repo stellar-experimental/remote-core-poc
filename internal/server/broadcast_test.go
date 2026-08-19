@@ -91,7 +91,7 @@ func TestBroadcasterFinishIsFinalAndIdempotent(t *testing.T) {
 	b.end([]byte("end"))
 	_, changed, _ := b.watch()
 
-	b.finish()
+	b.finish(nil)
 
 	select {
 	case <-changed:
@@ -101,7 +101,7 @@ func TestBroadcasterFinishIsFinalAndIdempotent(t *testing.T) {
 	if snap, _, ended := b.watch(); !ended || snap.seq() != 3 {
 		t.Fatalf("after finish: seq=%d ended=%v, want 3 and true", snap.seq(), ended)
 	}
-	b.finish()
+	b.finish(nil)
 	if _, _, ended := b.watch(); !ended {
 		t.Fatal("a second finish undid the first")
 	}
@@ -116,7 +116,7 @@ func TestBroadcasterGuardPanicsDoNotHoldTheLock(t *testing.T) {
 	}{
 		{
 			"begin after finish",
-			func(b *broadcaster) { b.finish() },
+			func(b *broadcaster) { b.finish(nil) },
 			func(b *broadcaster) { b.begin(1, nil) },
 			"server: ledger begun after the stream was finished",
 		},
@@ -206,6 +206,6 @@ func TestBroadcasterConcurrentWatchers(t *testing.T) {
 		}
 		b.end(wire.AppendEnd(nil, seq, 3, 0, int64(seq), 0))
 	}
-	b.finish()
+	b.finish(nil)
 	wg.Wait()
 }

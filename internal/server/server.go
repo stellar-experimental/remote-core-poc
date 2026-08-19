@@ -165,11 +165,12 @@ func (s *Server) Handler() http.Handler {
 // When Run returns, every connected subscriber is finished off with a normal
 // close — there is nothing more to stream, and a subscriber waiting on a dead
 // source would hang.
-func (s *Server) Run(ctx context.Context) error {
-	defer s.b.finish()
+func (s *Server) Run(ctx context.Context) (err error) {
+	defer func() { s.b.finish(err) }()
 
 	s.log.Info("source loop starting", "range", s.rng.String(), "chunk_size", s.chunkSize)
 
+	var prevSeq uint32  // the last emitted sequence; the chain must be dense
 	var assembly []byte // reused across ledgers; the store copies it to disk
 	// spare is a fallback CHUNK message allocation for ledgers whose size the
 	// source did not declare. Once published it belongs to subscribers and a
@@ -186,6 +187,15 @@ func (s *Server) Run(ctx context.Context) error {
 			return fmt.Errorf("source failed at ledger %d: %w", em.Seq, err)
 		}
 		seq := em.Seq
+		// Sources that carry their own sequences (the pipe tap parses them out
+		// of the metas) can skip or rewind — core re-emitting after a
+		// catchup->live handoff, say. The ring's own answer to a break in the
+		// chain is to unlink everything it holds, so refuse here instead: a
+		// visible failure beats silently discarding retained history.
+		if prevSeq != 0 && seq != prevSeq+1 {
+			return fmt.Errorf("source emitted ledger %d after %d: sequences must be dense and ascending", seq, prevSeq)
+		}
+		prevSeq = seq
 
 		// A ledger no subscriber could assemble is a failure here, not
 		// something to hand out: every client's assembly cap is the protocol
@@ -520,7 +530,12 @@ func (s *Server) serve(
 			// already been sent, then re-watch — more may have been published
 			// while these writes were in flight.
 			wrote := false
-			if !live.begun {
+			if !live.begun || live.f != snap.f {
+				// A DIFFERENT flow object carrying the same sequence is a
+				// fresh emission of that ledger (core re-emitting N across a
+				// catchup->live handoff or restart), not a continuation of
+				// the one being written: re-BEGIN so the client discards its
+				// partial, instead of splicing two bodies under one END.
 				if err := s.write(ctx, conn, snap.f.begin); err != nil {
 					return 0, "", err
 				}
@@ -599,6 +614,12 @@ func (s *Server) serve(
 		// Nothing to send: caught up mid-flow, or waiting for the source's
 		// first ledger.
 		if ended {
+			if srcErr := s.b.failure(); srcErr != nil {
+				// Never let a source failure look like a clean end: an
+				// unbounded consumer would see err == nil and stop ingesting
+				// with nothing to log or retry on.
+				return websocket.StatusInternalError, "source failed", nil
+			}
 			code, reason := endedClose(req, next)
 			return code, reason, nil
 		}
