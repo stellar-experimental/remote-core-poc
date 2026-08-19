@@ -234,7 +234,6 @@ func New(rawURL string, opts ...Option) *Stream {
 	s := &Stream{
 		rawURL:         rawURL,
 		maxPayloadSize: wire.DefaultMaxPayloadSize,
-		maxChunkSize:   wire.MaxChunkSize,
 		dialTimeout:    DefaultDialTimeout,
 	}
 	for _, opt := range opts {
@@ -293,7 +292,7 @@ func (s *Stream) RawLedgers(
 	}
 }
 
-// seqTracker enforces the in-order, gapless delivery both protocols promise.
+// seqTracker enforces the in-order, gapless delivery the protocol promises.
 // A tip subscription (expected 0) accepts whatever ledger arrives first and
 // holds the server to continuity from there. The last representable sequence
 // has no successor, so nothing may follow it: expected would wrap to 0 there —
@@ -356,25 +355,6 @@ func readMessage(ctx context.Context, conn *websocket.Conn, buf *bytes.Buffer) e
 	return nil
 }
 
-// finishClose classifies a read error once iteration is over, yielding
-// whatever the consumer should see. expected is the sequence still owed.
-func finishClose(
-	readErr error, ledgerRange ledgerbackend.Range, expected uint32, yield func([]byte, error) bool,
-) {
-	if done, cerr := classifyClose(readErr, expected); done {
-		if cerr == nil {
-			// An orderly close is only the end of the story when the range was
-			// actually delivered.
-			cerr = truncated(ledgerRange, expected)
-		}
-		if cerr != nil {
-			yield(nil, cerr)
-		}
-		return
-	}
-	yield(nil, fmt.Errorf("remoteledger: read: %w", readErr))
-}
-
 // stream is the read loop: reassemble BEGIN/CHUNK*/END into the complete raw
 // ledger, verify it, and yield it. The seam above cannot tell the difference —
 // only the observer sees the flow's timing.
@@ -397,18 +377,26 @@ func (s *Stream) stream(
 
 	for {
 		if err := readMessage(ctx, conn, &msgBuf); err != nil {
-			if asm.active {
-				if done, cerr := classifyClose(err, track.expected); done && cerr == nil {
-					// An orderly close in the middle of an announced ledger is
-					// a truncation even on an unbounded range: BEGIN promised a
-					// ledger the close did not deliver, and treating it as a
-					// clean end would make a server crash mid-emission
-					// indistinguishable from shutdown.
-					yield(nil, fmt.Errorf("%w: stream closed mid-assembly of ledger %d", ErrTruncated, asm.seq))
-					return
+			done, cerr := classifyClose(err, track.expected)
+			switch {
+			case !done:
+				yield(nil, fmt.Errorf("remoteledger: read: %w", err))
+			case cerr != nil:
+				yield(nil, cerr)
+			case asm.active:
+				// An orderly close in the middle of an announced ledger is a
+				// truncation even on an unbounded range: BEGIN promised a
+				// ledger the close did not deliver, and treating it as a clean
+				// end would make a server crash mid-emission indistinguishable
+				// from shutdown.
+				yield(nil, fmt.Errorf("%w: stream closed mid-assembly of ledger %d", ErrTruncated, asm.seq))
+			default:
+				// An orderly close is only the end of the story when the range
+				// was actually delivered.
+				if terr := truncated(ledgerRange, track.expected); terr != nil {
+					yield(nil, terr)
 				}
 			}
-			finishClose(err, ledgerRange, track.expected, yield)
 			return
 		}
 		m, err := wire.Decode(msgBuf.Bytes())

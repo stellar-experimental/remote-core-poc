@@ -402,8 +402,8 @@ func (s *Server) anchorTip() uint64 {
 	return uint64(snap.seq())
 }
 
-// readRing fetches ledger next from the retention ring — the catch-up path of
-// both protocols. ok is false with no error when the ring cannot serve next
+// readRing fetches ledger next from the retention ring — serve's catch-up
+// path. ok is false with no error when the ring cannot serve next
 // yet (nothing retained, or next is beyond the retained range): the caller
 // sleeps on the flow. A ledger missing INSIDE the bounds was pruned, so the
 // subscriber is too far behind; tooFar carries the close reason for
