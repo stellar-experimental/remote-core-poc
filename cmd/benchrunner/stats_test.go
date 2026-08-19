@@ -41,7 +41,8 @@ func TestCollectorSummary(t *testing.T) {
 	base := time.Now()
 	for i := range 4 {
 		// One ledger every 10 ms, each delivered 1 ms after it was emitted.
-		c.add(uint32(100+i), 1024, base.Add(time.Duration(i)*10*time.Millisecond), time.Millisecond, true)
+		c.add(base.Add(time.Duration(i)*10*time.Millisecond),
+			sample{seq: uint32(100 + i), bytes: 1024, delivery: time.Millisecond, hasDelivery: true})
 	}
 
 	out := c.summary()
@@ -61,8 +62,8 @@ func TestCollectorSummary(t *testing.T) {
 func TestCollectorSummaryWithoutStamps(t *testing.T) {
 	c := newCollector("local")
 	base := time.Now()
-	c.add(1, 10, base, 0, false)
-	c.add(2, 10, base.Add(time.Millisecond), 0, false)
+	c.add(base, sample{seq: 1, bytes: 10})
+	c.add(base.Add(time.Millisecond), sample{seq: 2, bytes: 10})
 
 	out := c.summary()
 	if !strings.Contains(out, "no emit stamps") {
@@ -79,20 +80,54 @@ func TestCollectorSummaryEmpty(t *testing.T) {
 func TestCollectorPartialStamps(t *testing.T) {
 	c := newCollector("mixed")
 	base := time.Now()
-	c.add(1, 10, base, 0, false) // replayed, no stamp
-	c.add(2, 10, base.Add(time.Millisecond), 2*time.Millisecond, true)
+	c.add(base, sample{seq: 1, bytes: 10, chunks: 1}) // replayed, no stamp
+	c.add(base.Add(time.Millisecond), sample{
+		seq: 2, bytes: 10, chunks: 1,
+		delivery: 2 * time.Millisecond, hasDelivery: true,
+		pipeline: 17 * time.Millisecond, hasPipeline: true,
+		emit: 15 * time.Millisecond, hasEmit: true,
+	})
 
 	out := c.summary()
-	if !strings.Contains(out, "1 ledger(s) excluded") {
-		t.Errorf("summary does not report the excluded ledger:\n%s", out)
+	for _, want := range []string{
+		"1 ledger(s) excluded",
+		// A chunked run reports the whole metric set, and states the
+		// fallback count even at zero — the gate is zero, so the report must
+		// show it was measured.
+		"t_emit", "15.00ms", "pipeline", "17.00ms",
+		"fallbacks    0 partial deliveries discarded",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("summary is missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestCollectorCountsFallbacks(t *testing.T) {
+	c := newCollector("fallbacks")
+	base := time.Now()
+	c.add(base, sample{seq: 1, bytes: 10, chunks: 1, discarded: 2})
+	c.add(base.Add(time.Millisecond), sample{seq: 2, bytes: 10, chunks: 1, discarded: 1})
+
+	if c.fallbacks() != 3 {
+		t.Errorf("fallbacks = %d, want 3", c.fallbacks())
+	}
+	if !strings.Contains(c.summary(), "3 partial deliveries discarded") {
+		t.Errorf("summary does not total the fallbacks:\n%s", c.summary())
 	}
 }
 
 func TestWriteCSV(t *testing.T) {
 	c := newCollector("csv")
 	base := time.Now()
-	c.add(7, 100, base, 0, false)
-	c.add(8, 200, base.Add(5*time.Millisecond), 3*time.Millisecond, true)
+	c.add(base, sample{seq: 7, bytes: 100})
+	c.add(base.Add(5*time.Millisecond), sample{
+		seq: 8, bytes: 200, chunks: 2,
+		delivery: 3 * time.Millisecond, hasDelivery: true,
+		pipeline: 18 * time.Millisecond, hasPipeline: true,
+		emit: 15 * time.Millisecond, hasEmit: true,
+		discarded: 1,
+	})
 
 	var buf strings.Builder
 	if err := c.writeCSV(&buf); err != nil {
@@ -105,14 +140,15 @@ func TestWriteCSV(t *testing.T) {
 	if len(rows) != 3 {
 		t.Fatalf("wrote %d rows, want a header and two ledgers", len(rows))
 	}
-	if rows[0][0] != "sequence" || rows[0][4] != "delivery_ns" {
+	if rows[0][0] != "sequence" || rows[0][5] != "emit_ns" || rows[0][6] != "delivery_ns" {
 		t.Errorf("header = %v", rows[0])
 	}
-	if rows[1][0] != "7" || rows[1][3] != "0" || rows[1][4] != "" {
-		t.Errorf("first ledger row = %v, want sequence 7, no gap and no delivery", rows[1])
+	if rows[1][0] != "7" || rows[1][4] != "0" || rows[1][5] != "" || rows[1][6] != "" {
+		t.Errorf("first ledger row = %v, want sequence 7, no gap and no measurements", rows[1])
 	}
-	if rows[2][3] != "5000000" || rows[2][4] != "3000000" {
-		t.Errorf("second ledger row = %v, want a 5ms gap and a 3ms delivery", rows[2])
+	if rows[2][4] != "5000000" || rows[2][5] != "15000000" || rows[2][6] != "3000000" ||
+		rows[2][7] != "18000000" || rows[2][8] != "1" {
+		t.Errorf("second ledger row = %v, want the 5ms gap and every measurement column filled", rows[2])
 	}
 }
 

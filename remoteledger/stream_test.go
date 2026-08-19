@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/coder/websocket"
 	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
 
@@ -38,15 +39,32 @@ func stub(t *testing.T, serve func(ctx context.Context, conn *websocket.Conn, q 
 	return ts.URL
 }
 
-// sendLedgers writes one message per sequence, with the given payload size.
-func sendLedgers(t *testing.T, conn *websocket.Conn, ctx context.Context, size int, seqs ...uint32) {
-	t.Helper()
+// send writes one binary message, ignoring a send on a departed consumer:
+// that is the test's business, not the stub's.
+func send(ctx context.Context, conn *websocket.Conn, msg []byte) {
+	_ = conn.Write(ctx, websocket.MessageBinary, msg)
+}
+
+// sendFlow writes one complete, correct flow for seq: BEGIN, one CHUNK per
+// piece, and an END whose counts and checksum match.
+func sendFlow(ctx context.Context, conn *websocket.Conn, seq uint32, emitStart, emitEnd int64, pieces ...[]byte) {
+	send(ctx, conn, wire.AppendBegin(nil, seq, emitStart))
+	hasher := xxhash.New()
+	total := 0
+	for i, p := range pieces {
+		hasher.Write(p)
+		total += len(p)
+		send(ctx, conn, wire.AppendChunk(nil, seq, uint32(i), p))
+	}
+	send(ctx, conn, wire.AppendEnd(nil, seq, uint32(len(pieces)), uint64(total), emitEnd, hasher.Sum64()))
+}
+
+// sendLedgers writes one single-chunk flow per sequence, with the given
+// payload size, each payload filled with its sequence's low byte.
+func sendLedgers(ctx context.Context, conn *websocket.Conn, size int, seqs ...uint32) {
 	for _, seq := range seqs {
-		payload := bytes.Repeat([]byte{byte(seq)}, size)
-		msg := wire.AppendLedger(nil, seq, time.Now().UnixNano(), payload)
-		if err := conn.Write(ctx, websocket.MessageBinary, msg); err != nil {
-			return // the consumer went away; that is the test's business
-		}
+		sendFlow(ctx, conn, seq, time.Now().UnixNano(), time.Now().UnixNano(),
+			bytes.Repeat([]byte{byte(seq)}, size))
 	}
 }
 
@@ -83,7 +101,7 @@ func TestRawLedgersDeliversBoundedRange(t *testing.T) {
 		if got := q.Get("end"); got != "7" {
 			t.Errorf("end parameter = %q, want 7", got)
 		}
-		sendLedgers(t, conn, ctx, 64, 5, 6, 7)
+		sendLedgers(ctx, conn, 64, 5, 6, 7)
 	})
 
 	r := drain(t.Context(), New(url), ledgerbackend.BoundedRange(5, 7))
@@ -98,10 +116,59 @@ func TestRawLedgersDeliversBoundedRange(t *testing.T) {
 	}
 }
 
+func TestRawLedgersReassemblesChunkFlows(t *testing.T) {
+	const emitStart, emitEnd int64 = 1700000000000000000, 1700000000015000000
+	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
+		sendFlow(ctx, conn, 5, emitStart, emitEnd, []byte("hello, "), []byte("world"))
+		sendFlow(ctx, conn, 6, 0, 0, []byte("ring-replayed"))
+	})
+
+	var infos []LedgerInfo
+	var payloads [][]byte
+	s := New(url, WithObserver(func(info LedgerInfo) { infos = append(infos, info) }))
+	for raw, err := range s.RawLedgers(t.Context(), ledgerbackend.BoundedRange(5, 6)) {
+		if err != nil {
+			t.Fatalf("stream error: %v", err)
+		}
+		payloads = append(payloads, bytes.Clone(raw))
+	}
+	if len(payloads) != 2 {
+		t.Fatalf("received %d ledgers, want 2", len(payloads))
+	}
+	if string(payloads[0]) != "hello, world" || string(payloads[1]) != "ring-replayed" {
+		t.Fatalf("assembled %q and %q", payloads[0], payloads[1])
+	}
+
+	live := infos[0]
+	if live.Sequence != 5 || live.Chunks != 2 || live.Size != len("hello, world") {
+		t.Errorf("live info = %+v, want ledger 5 in 2 chunks", live)
+	}
+	if live.EmitStartUnixNano != emitStart || live.EmitEndUnixNano != emitEnd {
+		t.Errorf("stamps = (%d, %d), want the flow's", live.EmitStartUnixNano, live.EmitEndUnixNano)
+	}
+	if d, ok := live.Delivery(); !ok || d != time.Duration(live.ReceivedUnixNano-emitEnd) {
+		t.Errorf("delivery = (%s, %v), want received minus emit-end", d, ok)
+	}
+	if w, ok := live.EmitWindow(); !ok || w != time.Duration(emitEnd-emitStart) {
+		t.Errorf("emit window = (%s, %v), want emit-end minus emit-start", w, ok)
+	}
+	if p, ok := live.Pipeline(); !ok || p != time.Duration(live.ReceivedUnixNano-emitStart) {
+		t.Errorf("pipeline = (%s, %v), want received minus emit-start", p, ok)
+	}
+
+	replayed := infos[1]
+	if _, ok := replayed.Delivery(); ok {
+		t.Error("a ring-replayed flow reported a delivery latency")
+	}
+	if replayed.DiscardedPartials != 0 {
+		t.Errorf("replayed ledger discarded %d partials, want 0", replayed.DiscardedPartials)
+	}
+}
+
 func TestRawLedgersStopsAtRangeEnd(t *testing.T) {
 	// The server keeps going; a bounded range must stop the consumer anyway.
 	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
-		sendLedgers(t, conn, ctx, 32, 1, 2, 3, 4, 5)
+		sendLedgers(ctx, conn, 32, 1, 2, 3, 4, 5)
 	})
 	r := drain(t.Context(), New(url), ledgerbackend.BoundedRange(1, 3))
 	if r.err != nil {
@@ -109,32 +176,6 @@ func TestRawLedgersStopsAtRangeEnd(t *testing.T) {
 	}
 	if r.count != 3 {
 		t.Errorf("received %d ledgers, want 3", r.count)
-	}
-}
-
-func TestRawLedgersDetectsGap(t *testing.T) {
-	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
-		sendLedgers(t, conn, ctx, 32, 5, 6, 8)
-	})
-	r := drain(t.Context(), New(url), ledgerbackend.UnboundedRange(5))
-	if !errors.Is(r.err, ErrGap) {
-		t.Fatalf("error = %v, want ErrGap", r.err)
-	}
-	if r.count != 2 {
-		t.Errorf("received %d ledgers before the gap, want 2", r.count)
-	}
-	if !strings.Contains(r.err.Error(), "expected 7") {
-		t.Errorf("error %v does not say which ledger was expected", r.err)
-	}
-}
-
-func TestRawLedgersDetectsWrongFirstLedger(t *testing.T) {
-	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
-		sendLedgers(t, conn, ctx, 32, 11)
-	})
-	r := drain(t.Context(), New(url), ledgerbackend.UnboundedRange(10))
-	if !errors.Is(r.err, ErrGap) {
-		t.Fatalf("error = %v, want ErrGap", r.err)
 	}
 }
 
@@ -146,7 +187,7 @@ func TestRawLedgersFromTipAcceptsAnyFirstLedger(t *testing.T) {
 		if _, ok := q["end"]; ok {
 			t.Error("an unbounded range sent an end parameter")
 		}
-		sendLedgers(t, conn, ctx, 32, 900, 901)
+		sendLedgers(ctx, conn, 32, 900, 901)
 		_ = conn.Close(websocket.StatusNormalClosure, "")
 	})
 	r := drain(t.Context(), New(url), ledgerbackend.UnboundedRange(0))
@@ -158,9 +199,51 @@ func TestRawLedgersFromTipAcceptsAnyFirstLedger(t *testing.T) {
 	}
 }
 
+func TestRawLedgersSequenceRules(t *testing.T) {
+	tests := []struct {
+		name string
+		rng  ledgerbackend.Range
+		send func(ctx context.Context, conn *websocket.Conn)
+		want error
+	}{
+		{"gap between ledgers", ledgerbackend.UnboundedRange(5),
+			func(ctx context.Context, conn *websocket.Conn) {
+				sendLedgers(ctx, conn, 32, 5, 6, 8)
+			}, ErrGap},
+		{"wrong first ledger", ledgerbackend.UnboundedRange(10),
+			func(ctx context.Context, conn *websocket.Conn) {
+				sendLedgers(ctx, conn, 32, 11)
+			}, ErrGap},
+		{"BEGIN for another ledger mid-assembly", ledgerbackend.UnboundedRange(1),
+			func(ctx context.Context, conn *websocket.Conn) {
+				send(ctx, conn, wire.AppendBegin(nil, 1, 0))
+				send(ctx, conn, wire.AppendBegin(nil, 2, 0))
+			}, ErrProtocol},
+		// A tip subscription accepts any first ledger, including the ceiling.
+		// What it must not accept is a ledger after it: expected wraps to 0
+		// there, the value that means "any first ledger", so a wrap would
+		// silently re-open the stream.
+		{"wrap past the ceiling", ledgerbackend.UnboundedRange(0),
+			func(ctx context.Context, conn *websocket.Conn) {
+				sendLedgers(ctx, conn, 32, math.MaxUint32, 1)
+			}, ErrGap},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
+				tt.send(ctx, conn)
+			})
+			r := drain(t.Context(), New(url), tt.rng)
+			if !errors.Is(r.err, tt.want) {
+				t.Fatalf("error = %v, want %v", r.err, tt.want)
+			}
+		})
+	}
+}
+
 func TestRawLedgersNormalCloseEndsIteration(t *testing.T) {
 	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
-		sendLedgers(t, conn, ctx, 16, 1, 2)
+		sendLedgers(ctx, conn, 16, 1, 2)
 		_ = conn.Close(websocket.StatusNormalClosure, "source ended")
 	})
 	r := drain(t.Context(), New(url), ledgerbackend.UnboundedRange(1))
@@ -176,7 +259,7 @@ func TestRawLedgersTruncatedBoundedRange(t *testing.T) {
 	// A clean close is not the end of the story for a bounded range: the contract
 	// is every ledger in it, so a short delivery must not look like completion.
 	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
-		sendLedgers(t, conn, ctx, 32, 1, 2)
+		sendLedgers(ctx, conn, 32, 1, 2)
 		_ = conn.Close(websocket.StatusNormalClosure, "source ended")
 	})
 	r := drain(t.Context(), New(url), ledgerbackend.BoundedRange(1, 5))
@@ -208,10 +291,31 @@ func TestRawLedgersTruncatedWithNothingDelivered(t *testing.T) {
 	}
 }
 
+func TestRawLedgersTruncatedMidAssembly(t *testing.T) {
+	// A clean close in the middle of a flow: the partial is dropped and the
+	// bounded shortfall reported, exactly as if the flow had never begun.
+	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
+		sendFlow(ctx, conn, 1, 0, 0, []byte("whole"))
+		send(ctx, conn, wire.AppendBegin(nil, 2, 0))
+		send(ctx, conn, wire.AppendChunk(nil, 2, 0, []byte("partial")))
+		_ = conn.Close(websocket.StatusNormalClosure, "source ended")
+	})
+	r := drain(t.Context(), New(url), ledgerbackend.BoundedRange(1, 3))
+	if !errors.Is(r.err, ErrTruncated) {
+		t.Fatalf("error = %v, want ErrTruncated", r.err)
+	}
+	if r.count != 1 {
+		t.Errorf("received %d ledgers, want the 1 complete one", r.count)
+	}
+	if !strings.Contains(r.err.Error(), "got through ledger 1") {
+		t.Errorf("error %v does not name the last complete ledger", r.err)
+	}
+}
+
 func TestRawLedgersTruncatedOnGoingAway(t *testing.T) {
 	// What corestreamd itself sends when its source ends mid-range.
 	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
-		sendLedgers(t, conn, ctx, 32, 4)
+		sendLedgers(ctx, conn, 32, 4)
 		_ = conn.Close(websocket.StatusGoingAway, "source ended before range complete")
 	})
 	r := drain(t.Context(), New(url), ledgerbackend.BoundedRange(4, 6))
@@ -227,7 +331,7 @@ func TestRawLedgersCompleteBoundedRangeHasNoError(t *testing.T) {
 	// The regression the truncation check must not break: a range delivered in
 	// full ends silently, even when the server closes right after it.
 	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
-		sendLedgers(t, conn, ctx, 32, 1, 2, 3)
+		sendLedgers(ctx, conn, 32, 1, 2, 3)
 		_ = conn.Close(websocket.StatusNormalClosure, "range complete")
 	})
 	r := drain(t.Context(), New(url), ledgerbackend.BoundedRange(1, 3))
@@ -257,7 +361,7 @@ func TestRawLedgersTipBoundedCloseStaysClean(t *testing.T) {
 func TestRawLedgersAbruptCloseIsAnError(t *testing.T) {
 	// No close frame at all: not truncation, but it must not pass for completion.
 	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
-		sendLedgers(t, conn, ctx, 32, 1)
+		sendLedgers(ctx, conn, 32, 1)
 		_ = conn.CloseNow()
 	})
 	r := drain(t.Context(), New(url), ledgerbackend.BoundedRange(1, 4))
@@ -303,22 +407,83 @@ func TestRawLedgersTooFarBehindWithoutBounds(t *testing.T) {
 	}
 }
 
-func TestRawLedgersRejectsBadMessages(t *testing.T) {
+func TestRawLedgersDiscardsPartialOnRingRedelivery(t *testing.T) {
+	// The slow-subscriber story from the client's side: a live flow opens,
+	// some chunks land, and then a fresh BEGIN for the SAME sequence arrives —
+	// the server abandoned the live flow and the ring is redelivering. The
+	// partial must be thrown away, and the eventual ledger reported with a
+	// discard count and no stamps.
+	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
+		send(ctx, conn, wire.AppendBegin(nil, 9, time.Now().UnixNano()))
+		send(ctx, conn, wire.AppendChunk(nil, 9, 0, []byte("partial that must v")))
+		send(ctx, conn, wire.AppendChunk(nil, 9, 1, []byte("anish")))
+		sendFlow(ctx, conn, 9, 0, 0, []byte("the complete"), []byte(" ledger"))
+	})
+
+	var infos []LedgerInfo
+	var got []byte
+	s := New(url, WithObserver(func(info LedgerInfo) { infos = append(infos, info) }))
+	for raw, err := range s.RawLedgers(t.Context(), ledgerbackend.SingleLedgerRange(9)) {
+		if err != nil {
+			t.Fatalf("stream error: %v", err)
+		}
+		got = bytes.Clone(raw)
+	}
+	if string(got) != "the complete ledger" {
+		t.Fatalf("assembled %q, want the redelivered ledger, not the partial", got)
+	}
+	if len(infos) != 1 || infos[0].DiscardedPartials != 1 {
+		t.Fatalf("infos = %+v, want one ledger with one discarded partial", infos)
+	}
+	if _, ok := infos[0].Delivery(); ok {
+		t.Error("a ring-redelivered ledger reported a delivery latency")
+	}
+}
+
+func TestRawLedgersProtocolViolations(t *testing.T) {
+	// Every violation the END-time verification exists to catch. None of these
+	// may pass silently: an unverifiable ledger must never be handed up.
 	tests := []struct {
 		name string
 		send func(ctx context.Context, conn *websocket.Conn)
 		want string
 	}{
-		{"text message", func(ctx context.Context, conn *websocket.Conn) {
-			_ = conn.Write(ctx, websocket.MessageText, []byte("hello"))
-		}, "unexpected"},
+		{"chunk out of order", func(ctx context.Context, conn *websocket.Conn) {
+			send(ctx, conn, wire.AppendBegin(nil, 1, 0))
+			send(ctx, conn, wire.AppendChunk(nil, 1, 1, []byte("x")))
+		}, "expected chunk 0"},
+		{"chunk without a flow", func(ctx context.Context, conn *websocket.Conn) {
+			send(ctx, conn, wire.AppendChunk(nil, 1, 0, []byte("x")))
+		}, "outside its flow"},
+		{"chunk for another ledger", func(ctx context.Context, conn *websocket.Conn) {
+			send(ctx, conn, wire.AppendBegin(nil, 1, 0))
+			send(ctx, conn, wire.AppendChunk(nil, 2, 0, []byte("x")))
+		}, "outside its flow"},
+		{"end without a flow", func(ctx context.Context, conn *websocket.Conn) {
+			send(ctx, conn, wire.AppendEnd(nil, 1, 0, 0, 0, 0))
+		}, "outside its flow"},
+		{"chunk count mismatch", func(ctx context.Context, conn *websocket.Conn) {
+			send(ctx, conn, wire.AppendBegin(nil, 1, 0))
+			send(ctx, conn, wire.AppendChunk(nil, 1, 0, []byte("x")))
+			send(ctx, conn, wire.AppendEnd(nil, 1, 2, 1, 0, xxhash.Sum64([]byte("x"))))
+		}, "declares 2 chunks"},
+		{"length mismatch", func(ctx context.Context, conn *websocket.Conn) {
+			send(ctx, conn, wire.AppendBegin(nil, 1, 0))
+			send(ctx, conn, wire.AppendChunk(nil, 1, 0, []byte("x")))
+			send(ctx, conn, wire.AppendEnd(nil, 1, 1, 2, 0, xxhash.Sum64([]byte("x"))))
+		}, "declares 2 bytes"},
+		{"checksum mismatch", func(ctx context.Context, conn *websocket.Conn) {
+			send(ctx, conn, wire.AppendBegin(nil, 1, 0))
+			send(ctx, conn, wire.AppendChunk(nil, 1, 0, []byte("x")))
+			send(ctx, conn, wire.AppendEnd(nil, 1, 1, 1, 0, 0xbad))
+		}, "checksum mismatch"},
 		{"truncated header", func(ctx context.Context, conn *websocket.Conn) {
-			_ = conn.Write(ctx, websocket.MessageBinary, []byte{0x01, 0x01})
+			send(ctx, conn, []byte{wire.Version, wire.TypeBegin})
 		}, "shorter than header"},
-		{"wrong version", func(ctx context.Context, conn *websocket.Conn) {
-			msg := wire.AppendLedger(nil, 1, 0, []byte("x"))
-			msg[0] = 0x09
-			_ = conn.Write(ctx, websocket.MessageBinary, msg)
+		{"retired version byte", func(ctx context.Context, conn *websocket.Conn) {
+			msg := wire.AppendBegin(nil, 1, 0)
+			msg[0] = 0x01
+			send(ctx, conn, msg)
 		}, "version"},
 	}
 	for _, tt := range tests {
@@ -328,7 +493,10 @@ func TestRawLedgersRejectsBadMessages(t *testing.T) {
 			})
 			r := drain(t.Context(), New(url), ledgerbackend.UnboundedRange(1))
 			if r.err == nil {
-				t.Fatal("stream accepted a malformed message")
+				t.Fatal("the stream accepted a protocol violation")
+			}
+			if r.count != 0 {
+				t.Errorf("%d ledgers were yielded from a broken flow", r.count)
 			}
 			if !strings.Contains(r.err.Error(), tt.want) {
 				t.Errorf("error = %v, want it to mention %q", r.err, tt.want)
@@ -337,12 +505,21 @@ func TestRawLedgersRejectsBadMessages(t *testing.T) {
 	}
 }
 
+func TestRawLedgersRejectsTextMessages(t *testing.T) {
+	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
+		_ = conn.Write(ctx, websocket.MessageText, []byte("hello"))
+	})
+	r := drain(t.Context(), New(url), ledgerbackend.UnboundedRange(1))
+	if r.err == nil || !strings.Contains(r.err.Error(), "unexpected") {
+		t.Fatalf("error = %v, want a text message rejected", r.err)
+	}
+}
+
 func TestRawLedgersYieldsBorrowedSlices(t *testing.T) {
 	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
-		sendLedgers(t, conn, ctx, 64, 1, 2)
+		sendLedgers(ctx, conn, 64, 1, 2)
 	})
-	var borrowed []byte
-	var copied []byte
+	var borrowed, copied []byte
 	for raw, err := range New(url).RawLedgers(t.Context(), ledgerbackend.BoundedRange(1, 2)) {
 		if err != nil {
 			t.Fatalf("stream error: %v", err)
@@ -357,47 +534,51 @@ func TestRawLedgersYieldsBorrowedSlices(t *testing.T) {
 	}
 }
 
-func TestRawLedgersHonoursMaxMessageSize(t *testing.T) {
-	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
-		sendLedgers(t, conn, ctx, 4096, 1)
+func TestRawLedgersAssemblyCap(t *testing.T) {
+	// The per-ledger cap is an assembly-buffer cap: chunks may be individually
+	// small and still add up past it — and a ledger of exactly the cap passes.
+	t.Run("over the cap", func(t *testing.T) {
+		url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
+			send(ctx, conn, wire.AppendBegin(nil, 1, 0))
+			send(ctx, conn, wire.AppendChunk(nil, 1, 0, bytes.Repeat([]byte{1}, 100)))
+			send(ctx, conn, wire.AppendChunk(nil, 1, 1, bytes.Repeat([]byte{2}, 100)))
+		})
+		r := drain(t.Context(), New(url, WithMaxMessageSize(150)), ledgerbackend.UnboundedRange(1))
+		if !errors.Is(r.err, ErrProtocol) {
+			t.Fatalf("error = %v, want the payload cap violation", r.err)
+		}
+		if !strings.Contains(r.err.Error(), "payload cap") {
+			t.Errorf("error %v does not name the cap", r.err)
+		}
 	})
-	r := drain(t.Context(), New(url, WithMaxMessageSize(512)), ledgerbackend.UnboundedRange(1))
-	if r.err == nil {
-		t.Fatal("a message over the limit was accepted")
-	}
+	t.Run("exactly at the cap", func(t *testing.T) {
+		url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
+			sendFlow(ctx, conn, 1, 0, 0, bytes.Repeat([]byte{1}, 100), bytes.Repeat([]byte{2}, 50))
+		})
+		r := drain(t.Context(), New(url, WithMaxMessageSize(150)), ledgerbackend.SingleLedgerRange(1))
+		if r.err != nil {
+			t.Fatalf("a ledger of exactly the cap was rejected: %v", r.err)
+		}
+		if r.count != 1 || r.sizes[0] != 150 {
+			t.Errorf("received %d ledgers with sizes %v, want one of 150", r.count, r.sizes)
+		}
+	})
 }
 
-func TestRawLedgersObserverSeesStamps(t *testing.T) {
-	const emit int64 = 1700000000000000000
+func TestRawLedgersChunkOverTheReadLimitIsRejected(t *testing.T) {
 	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
-		_ = conn.Write(ctx, websocket.MessageBinary, wire.AppendLedger(nil, 4, emit, make([]byte, 100)))
-		_ = conn.Write(ctx, websocket.MessageBinary, wire.AppendLedger(nil, 5, 0, make([]byte, 100)))
-		_ = conn.Close(websocket.StatusNormalClosure, "")
+		send(ctx, conn, wire.AppendBegin(nil, 1, 0))
+		send(ctx, conn, wire.AppendChunk(nil, 1, 0, bytes.Repeat([]byte{1}, 8<<10)))
 	})
-
-	var infos []LedgerInfo
-	stream := New(url, WithObserver(func(info LedgerInfo) { infos = append(infos, info) }))
-	if r := drain(t.Context(), stream, ledgerbackend.UnboundedRange(4)); r.err != nil {
-		t.Fatalf("stream error: %v", r.err)
-	}
-	if len(infos) != 2 {
-		t.Fatalf("observer saw %d ledgers, want 2", len(infos))
-	}
-	if infos[0].Sequence != 4 || infos[0].EmitUnixNano != emit || infos[0].Size != 100 {
-		t.Errorf("first ledger info = %+v, want sequence 4, the emit stamp and 100 bytes", infos[0])
-	}
-	if d, ok := infos[0].Delivery(); !ok || d != time.Duration(infos[0].ReceivedUnixNano-emit) {
-		t.Errorf("delivery = (%s, %v), want the receive-minus-emit difference", d, ok)
-	}
-	// A replayed ledger carries no stamp, so it has no delivery latency.
-	if _, ok := infos[1].Delivery(); ok {
-		t.Error("a ledger without an emit stamp reported a delivery latency")
+	r := drain(t.Context(), New(url, WithMaxChunkSize(4<<10)), ledgerbackend.UnboundedRange(1))
+	if r.err == nil {
+		t.Fatal("a chunk over the read limit was accepted")
 	}
 }
 
 func TestRawLedgersCancelTearsDown(t *testing.T) {
 	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
-		sendLedgers(t, conn, ctx, 32, 1)
+		sendLedgers(ctx, conn, 32, 1)
 		<-ctx.Done() // hold the stream open until the client leaves
 	})
 	ctx, cancel := context.WithCancel(t.Context())
@@ -425,7 +606,7 @@ func TestRawLedgersIgnoresStreamOptions(t *testing.T) {
 	// implementation cannot read one. Accepting and ignoring them is documented,
 	// and must not break the stream.
 	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
-		sendLedgers(t, conn, ctx, 32, 1, 2)
+		sendLedgers(ctx, conn, 32, 1, 2)
 	})
 	count := 0
 	for _, err := range New(url).RawLedgers(t.Context(), ledgerbackend.BoundedRange(1, 2),
@@ -460,16 +641,37 @@ func TestDialFailures(t *testing.T) {
 	}
 }
 
+func TestReadLimitIsChunkSized(t *testing.T) {
+	// The connection admits one chunk message, not one whole ledger: the
+	// ledger cap lives on the assembly buffer instead.
+	if got, want := New("ws://box").readLimit(), int64(wire.MaxChunkSize+wire.ChunkHeaderSize); got != want {
+		t.Errorf("default read limit = %d, want %d (max chunk plus header)", got, want)
+	}
+	if got := New("ws://box", WithMaxChunkSize(64<<10)).readLimit(); got != 64<<10+wire.ChunkHeaderSize {
+		t.Errorf("read limit for a 64 KiB chunk cap = %d, want %d", got, 64<<10+wire.ChunkHeaderSize)
+	}
+	// However small the chunk cap, an END message must still be admitted, or
+	// every flow would die at its last message.
+	if got := New("ws://box", WithMaxChunkSize(0)).readLimit(); got < wire.EndSize {
+		t.Errorf("read limit for a zero chunk cap = %d, cannot admit an END (%d bytes)", got, wire.EndSize)
+	}
+	// An enormous cap must saturate, not wrap to a negative limit — negative
+	// is how the library spells "no limit at all".
+	if got := New("ws://box", WithMaxChunkSize(math.MaxInt64)).readLimit(); got != math.MaxInt64 {
+		t.Errorf("read limit for the int64 ceiling = %d, want it saturated at MaxInt64", got)
+	}
+}
+
 func TestEndpointScrubsStaleRangeParams(t *testing.T) {
 	// The range owns start and end. A URL configured with either must not leak
 	// into a call that asked for something else; unrelated parameters survive.
-	stream := New("ws://box:8462/v1/stream?start=9&end=5&token=abc")
+	stream := New("ws://box:8462/stream?start=9&end=5&token=abc")
 
 	got, err := stream.endpoint(ledgerbackend.UnboundedRange(10))
 	if err != nil {
 		t.Fatalf("endpoint: %v", err)
 	}
-	if want := "ws://box:8462/v1/stream?start=10&token=abc"; got != want {
+	if want := "ws://box:8462/stream?start=10&token=abc"; got != want {
 		t.Errorf("endpoint = %q, want %q", got, want)
 	}
 
@@ -477,7 +679,7 @@ func TestEndpointScrubsStaleRangeParams(t *testing.T) {
 	if err != nil {
 		t.Fatalf("endpoint: %v", err)
 	}
-	if want := "ws://box:8462/v1/stream?end=3&start=2&token=abc"; got != want {
+	if want := "ws://box:8462/stream?end=3&start=2&token=abc"; got != want {
 		t.Errorf("endpoint = %q, want %q", got, want)
 	}
 }
@@ -517,97 +719,6 @@ func TestRawLedgersRejectsCeilingRangeBeforeDialing(t *testing.T) {
 	}
 }
 
-func TestRawLedgersRejectsSequenceWrap(t *testing.T) {
-	// A tip subscription accepts any first ledger, including the ceiling. What it
-	// must not accept is a ledger after it: expected wraps to 0 there, the value
-	// that means "any first ledger", so a wrap would re-open the stream.
-	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
-		sendLedgers(t, conn, ctx, 32, math.MaxUint32, 1)
-	})
-	r := drain(t.Context(), New(url), ledgerbackend.UnboundedRange(0))
-	if !errors.Is(r.err, ErrGap) {
-		t.Fatalf("error = %v, want ErrGap", r.err)
-	}
-	if r.count != 1 {
-		t.Errorf("received %d ledgers, want the 1 before the wrap", r.count)
-	}
-	if !strings.Contains(r.err.Error(), "last representable") {
-		t.Errorf("error %v does not explain the wrap", r.err)
-	}
-}
-
-func TestReadLimitAdmitsTheLargestPayload(t *testing.T) {
-	// The read limit is a whole-message ceiling, so capping it at the payload size
-	// would reject the largest ledger by exactly the header.
-	if got, want := New("ws://box").readLimit(), wire.DefaultMaxPayloadSize+wire.HeaderSize; got != want {
-		t.Errorf("default read limit = %d, want %d (256 MiB payload plus header)", got, want)
-	}
-	if got := New("ws://box", WithMaxMessageSize(4096)).readLimit(); got != 4096+wire.HeaderSize {
-		t.Errorf("read limit for a 4096-byte cap = %d, want %d", got, 4096+wire.HeaderSize)
-	}
-	if got := New("ws://box", WithMaxMessageSize(-1)).readLimit(); got != -1 {
-		t.Errorf("read limit for a negative cap = %d, want -1 (no limit)", got)
-	}
-}
-
-func TestReadLimitSaturatesInsteadOfOverflowing(t *testing.T) {
-	// Adding the header to a cap near the int64 ceiling would wrap to a negative
-	// number, which is how the library spells "no limit at all" — the one thing an
-	// enormous cap must not turn into.
-	tests := []struct {
-		name string
-		cap  int64
-		want int64
-	}{
-		{"the int64 ceiling", math.MaxInt64, math.MaxInt64},
-		{"one header short of it", math.MaxInt64 - wire.HeaderSize, math.MaxInt64},
-		{"two headers short of it", math.MaxInt64 - wire.HeaderSize - 1, math.MaxInt64 - 1},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := New("ws://box", WithMaxMessageSize(tt.cap)).readLimit()
-			if got != tt.want {
-				t.Errorf("read limit for a cap of %d = %d, want %d", tt.cap, got, tt.want)
-			}
-			if got < 0 {
-				t.Errorf("read limit for a cap of %d is negative, which disables the cap", tt.cap)
-			}
-		})
-	}
-}
-
-func TestRawLedgersPayloadAtTheLimit(t *testing.T) {
-	const limit = 64 << 10
-	tests := []struct {
-		name    string
-		size    int
-		wantErr bool
-	}{
-		{"exactly at the limit", limit, false},
-		{"one byte over", limit + 1, true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
-				sendLedgers(t, conn, ctx, tt.size, 1)
-			})
-			r := drain(t.Context(), New(url, WithMaxMessageSize(limit)), ledgerbackend.SingleLedgerRange(1))
-			if tt.wantErr {
-				if r.err == nil {
-					t.Fatalf("a %d-byte payload passed a %d-byte cap", tt.size, limit)
-				}
-				return
-			}
-			if r.err != nil {
-				t.Fatalf("a %d-byte payload was rejected by a %d-byte cap: %v", tt.size, limit, r.err)
-			}
-			if r.count != 1 || r.sizes[0] != tt.size {
-				t.Errorf("received %d ledgers with sizes %v, want one of %d", r.count, r.sizes, tt.size)
-			}
-		})
-	}
-}
-
 func TestEndpoint(t *testing.T) {
 	tests := []struct {
 		name string
@@ -616,21 +727,21 @@ func TestEndpoint(t *testing.T) {
 		want string
 	}{
 		{"origin gets the stream path", "ws://box:8462", ledgerbackend.UnboundedRange(10),
-			"ws://box:8462/v1/stream?start=10"},
+			"ws://box:8462/stream?start=10"},
 		{"trailing slash", "ws://box:8462/", ledgerbackend.UnboundedRange(10),
-			"ws://box:8462/v1/stream?start=10"},
+			"ws://box:8462/stream?start=10"},
 		{"http is rewritten", "http://box:8462", ledgerbackend.UnboundedRange(10),
-			"ws://box:8462/v1/stream?start=10"},
+			"ws://box:8462/stream?start=10"},
 		{"https is rewritten", "https://box", ledgerbackend.UnboundedRange(10),
-			"wss://box/v1/stream?start=10"},
+			"wss://box/stream?start=10"},
 		{"explicit path is kept", "ws://box/custom", ledgerbackend.UnboundedRange(1),
 			"ws://box/custom?start=1"},
 		{"bounded range", "ws://box", ledgerbackend.BoundedRange(4, 9),
-			"ws://box/v1/stream?end=9&start=4"},
+			"ws://box/stream?end=9&start=4"},
 		{"single ledger", "ws://box", ledgerbackend.SingleLedgerRange(7),
-			"ws://box/v1/stream?end=7&start=7"},
+			"ws://box/stream?end=7&start=7"},
 		{"tip", "ws://box", ledgerbackend.UnboundedRange(0),
-			"ws://box/v1/stream?start=0"},
+			"ws://box/stream?start=0"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

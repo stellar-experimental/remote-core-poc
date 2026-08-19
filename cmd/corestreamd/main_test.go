@@ -34,6 +34,53 @@ func TestParseFlagsDefaults(t *testing.T) {
 	if o.syntheticInterval != time.Second {
 		t.Errorf("default synthetic interval = %s, want 1s", o.syntheticInterval)
 	}
+	if o.chunkSize != wire.DefaultChunkSize {
+		t.Errorf("default chunk size = %d, want %d", o.chunkSize, wire.DefaultChunkSize)
+	}
+	if o.emitWindow != 15*time.Millisecond {
+		t.Errorf("default emit window = %s, want the 15ms disk-read proxy", o.emitWindow)
+	}
+	if o.cadence != 600*time.Millisecond {
+		t.Errorf("default cadence = %s, want the 600ms ledger close time", o.cadence)
+	}
+}
+
+func TestParseFlagsFileSource(t *testing.T) {
+	if _, err := parseFlags(io.Discard, []string{"--source", "file"}); err == nil {
+		t.Error("--source file without --file-dir was accepted")
+	}
+	o, err := parseFlags(io.Discard, []string{"--source", "file", "--file-dir", "/data/dump"})
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if o.fileDir != "/data/dump" || o.fileCount != 0 {
+		t.Errorf("file options = (%q, %d), want the dir and an endless count", o.fileDir, o.fileCount)
+	}
+	// A bounded file replay is subject to the sequence ceiling like any range.
+	if _, err := parseFlags(io.Discard, []string{
+		"--source", "file", "--file-dir", "d", "--start-ledger", "4294967290", "--file-count", "10",
+	}); err == nil || !strings.Contains(err.Error(), "4294967295") {
+		t.Errorf("a file range past the ceiling produced %v, want the ceiling named", err)
+	}
+}
+
+func TestParseFlagsPacingAndChunkBounds(t *testing.T) {
+	rejected := map[string][]string{
+		"chunk size below the floor":   {"--chunk-size", "1024"},
+		"chunk size above the ceiling": {"--chunk-size", "16777216"},
+		"negative emit window":         {"--emit-window", "-1ms"},
+		"negative cadence":             {"--cadence", "-1ms"},
+	}
+	for name, args := range rejected {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseFlags(io.Discard, args); err == nil {
+				t.Errorf("parseFlags(%v) succeeded, want an error", args)
+			}
+		})
+	}
+	if _, err := parseFlags(io.Discard, []string{"--chunk-size", "65536", "--emit-window", "0", "--cadence", "0"}); err != nil {
+		t.Errorf("valid pacing flags were rejected: %v", err)
+	}
 }
 
 func TestParseFlagsCaptiveRequirements(t *testing.T) {
@@ -143,8 +190,8 @@ func testServices(t *testing.T, count uint32) (*server.Server, *http.Server, net
 		t.Fatalf("store.Open: %v", err)
 	}
 	srv, err := server.New(server.Config{
-		Source: server.NewSyntheticStream(server.SyntheticConfig{Size: 64, Interval: time.Millisecond}),
-		Range:  server.SyntheticRange(1, count),
+		Source: server.PacedSource(server.NewSyntheticStream(server.SyntheticConfig{Size: 64}), 0, time.Millisecond),
+		Range:  server.CountedRange(1, count),
 		Store:  ring,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})

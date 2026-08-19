@@ -68,35 +68,45 @@ func Open(dir string, retention int) (*Store, error) {
 
 // rescan rebuilds the in-memory index from the directory contents.
 func (s *Store) rescan() error {
-	entries, err := os.ReadDir(s.dir)
+	seqs, err := ScanLedgerDir(s.dir)
 	if err != nil {
-		return fmt.Errorf("store: scan %q: %w", s.dir, err)
+		return fmt.Errorf("store: %w; delete the directory contents and restart", err)
+	}
+	if len(seqs) == 0 {
+		return nil
+	}
+	s.oldest, s.latest, s.filled = seqs[0], seqs[len(seqs)-1], true
+	return nil
+}
+
+// ScanLedgerDir lists the ledger sequences held in a directory of
+// LedgerFileName files, sorted ascending. The sequences must form a contiguous
+// range — replay correctness depends on contiguity, for the retention ring and
+// for a dump directory alike. Files with other names are ignored.
+func ScanLedgerDir(dir string) ([]uint32, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("scan %q: %w", dir, err)
 	}
 	var seqs []uint32
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
-		seq, ok := parseName(e.Name())
+		seq, ok := ParseLedgerFileName(e.Name())
 		if !ok {
 			continue
 		}
 		seqs = append(seqs, seq)
 	}
-	if len(seqs) == 0 {
-		return nil
-	}
 	slices.Sort(seqs)
 	for i := 1; i < len(seqs); i++ {
 		if seqs[i] != seqs[i-1]+1 {
-			return fmt.Errorf(
-				"store: %q holds a non-contiguous retention range (gap between ledger %d and %d); "+
-					"delete the directory contents and restart",
-				s.dir, seqs[i-1], seqs[i])
+			return nil, fmt.Errorf("%q holds a non-contiguous ledger range (gap between ledger %d and %d)",
+				dir, seqs[i-1], seqs[i])
 		}
 	}
-	s.oldest, s.latest, s.filled = seqs[0], seqs[len(seqs)-1], true
-	return nil
+	return seqs, nil
 }
 
 // Put stores raw as ledger seq and prunes anything beyond the retention count.
@@ -217,10 +227,19 @@ func (s *Store) clearLocked() error {
 }
 
 func (s *Store) path(seq uint32) string {
-	return filepath.Join(s.dir, filePrefix+strconv.FormatUint(uint64(seq), 10)+fileSuffix)
+	return filepath.Join(s.dir, LedgerFileName(seq))
 }
 
-func parseName(name string) (uint32, bool) {
+// LedgerFileName is ledger seq's on-disk file name. It is the naming contract
+// of the ring's directory — which doubles as the file replayer's dump format,
+// so the format is defined once, here.
+func LedgerFileName(seq uint32) string {
+	return filePrefix + strconv.FormatUint(uint64(seq), 10) + fileSuffix
+}
+
+// ParseLedgerFileName reads the sequence back out of a LedgerFileName. ok is
+// false for any other name.
+func ParseLedgerFileName(name string) (uint32, bool) {
 	if !strings.HasPrefix(name, filePrefix) || !strings.HasSuffix(name, fileSuffix) {
 		return 0, false
 	}

@@ -15,11 +15,13 @@ import (
 
 // harnessOpts configures a test server backed by the synthetic source.
 type harnessOpts struct {
-	start     uint32
-	count     uint32 // 0 = endless
-	size      int
-	interval  time.Duration
-	retention int
+	start      uint32
+	count      uint32 // 0 = endless
+	size       int
+	interval   time.Duration
+	emitWindow time.Duration // 0 = each ledger's bytes all at once
+	chunkSize  int           // 0 = the protocol default
+	retention  int
 }
 
 // harness is a running server: a real HTTP listener on 127.0.0.1 with the source
@@ -55,10 +57,11 @@ func startHarness(t *testing.T, opts harnessOpts) *harness {
 		t.Fatalf("store.Open: %v", err)
 	}
 	srv, err := New(Config{
-		Source: NewSyntheticStream(SyntheticConfig{Size: opts.size, Interval: opts.interval}),
-		Range:  SyntheticRange(opts.start, opts.count),
-		Store:  ring,
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Source:    PacedSource(NewSyntheticStream(SyntheticConfig{Size: opts.size}), opts.emitWindow, opts.interval),
+		ChunkSize: opts.chunkSize,
+		Range:     CountedRange(opts.start, opts.count),
+		Store:     ring,
+		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
 		t.Fatalf("server.New: %v", err)

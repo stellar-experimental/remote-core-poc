@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
 )
@@ -87,7 +86,7 @@ func TestSyntheticStreamStopsOnBreak(t *testing.T) {
 }
 
 func TestSyntheticStreamHonoursContextCancel(t *testing.T) {
-	s := NewSyntheticStream(SyntheticConfig{Size: 32, Interval: 50 * time.Millisecond})
+	s := NewSyntheticStream(SyntheticConfig{Size: 32})
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
@@ -109,13 +108,13 @@ func TestSyntheticStreamHonoursContextCancel(t *testing.T) {
 	}
 }
 
-func TestSyntheticRange(t *testing.T) {
-	unbounded := SyntheticRange(10, 0)
+func TestCountedRange(t *testing.T) {
+	unbounded := CountedRange(10, 0)
 	if unbounded.Bounded() || unbounded.From() != 10 {
-		t.Errorf("SyntheticRange(10, 0) = %s, want [10,latest)", unbounded)
+		t.Errorf("CountedRange(10, 0) = %s, want [10,latest)", unbounded)
 	}
-	bounded := SyntheticRange(10, 3)
+	bounded := CountedRange(10, 3)
 	if !bounded.Bounded() || bounded.From() != 10 || bounded.To() != 12 {
-		t.Errorf("SyntheticRange(10, 3) = %s, want [10,12]", bounded)
+		t.Errorf("CountedRange(10, 3) = %s, want [10,12]", bounded)
 	}
 }

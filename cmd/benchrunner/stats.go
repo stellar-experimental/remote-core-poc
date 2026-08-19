@@ -12,15 +12,31 @@ import (
 // sample is one received ledger.
 type sample struct {
 	seq uint32
-	// bytes is the ledger payload size.
-	bytes int
+	// bytes is the ledger payload size; chunks how many messages carried it
+	// (zero when consumed locally with no stream at all).
+	bytes  int
+	chunks int
 	// sinceStart is the offset from the first ledger of the run, which is what
-	// inter-arrival gaps are computed from.
+	// inter-arrival gaps are computed from. It is filled in by add.
 	sinceStart time.Duration
-	// delivery is receive minus the server's emit stamp. Absent for a locally
-	// consumed ledger and for one replayed from the server's retention.
+	// delivery is assembled-and-verified minus the server's emit-end stamp:
+	// the headline metric, how long after the source finished the ledger was
+	// usable. Absent for a locally consumed ledger and for one replayed from
+	// the server's retention.
 	delivery    time.Duration
 	hasDelivery bool
+	// pipeline is assembled minus emit-start: the whole path from the source's
+	// first byte. Absent whenever delivery is.
+	pipeline    time.Duration
+	hasPipeline bool
+	// emit is the server-side emission window T_emit (emitEnd - emitStart),
+	// measured on the server's clock alone.
+	emit    time.Duration
+	hasEmit bool
+	// discarded counts partial assemblies of this ledger thrown away before it
+	// arrived complete: each one is a server-side ring fallback. The
+	// acceptance gate is zero of these inside the measurement window.
+	discarded int
 }
 
 // collector accumulates samples for one run.
@@ -35,20 +51,14 @@ func newCollector(label string) *collector {
 	return &collector{label: label}
 }
 
-// add records a ledger of size n bytes, received now, with an optional delivery
-// latency.
-func (c *collector) add(seq uint32, n int, now time.Time, delivery time.Duration, hasDelivery bool) {
+// add records s, received at now. s.sinceStart is computed here.
+func (c *collector) add(now time.Time, s sample) {
 	if c.start.IsZero() {
 		c.start = now
 	}
-	c.samples = append(c.samples, sample{
-		seq:         seq,
-		bytes:       n,
-		sinceStart:  now.Sub(c.start),
-		delivery:    delivery,
-		hasDelivery: hasDelivery,
-	})
-	c.bytes += int64(n)
+	s.sinceStart = now.Sub(c.start)
+	c.samples = append(c.samples, s)
+	c.bytes += int64(s.bytes)
 }
 
 // elapsed is the wall time from the first ledger to the last. A single ledger
@@ -71,14 +81,48 @@ func (c *collector) interArrivals() []time.Duration {
 	return gaps
 }
 
-func (c *collector) deliveries() []time.Duration {
+// durations filters one optional per-sample metric out of the run.
+func (c *collector) durations(metric func(sample) (time.Duration, bool)) []time.Duration {
 	var ds []time.Duration
 	for _, s := range c.samples {
-		if s.hasDelivery {
-			ds = append(ds, s.delivery)
+		if d, ok := metric(s); ok {
+			ds = append(ds, d)
 		}
 	}
 	return ds
+}
+
+func (c *collector) deliveries() []time.Duration {
+	return c.durations(func(s sample) (time.Duration, bool) { return s.delivery, s.hasDelivery })
+}
+
+func (c *collector) pipelines() []time.Duration {
+	return c.durations(func(s sample) (time.Duration, bool) { return s.pipeline, s.hasPipeline })
+}
+
+func (c *collector) emits() []time.Duration {
+	return c.durations(func(s sample) (time.Duration, bool) { return s.emit, s.hasEmit })
+}
+
+// fallbacks is how many partial deliveries were discarded across the run: the
+// client-side count of server ring fallbacks.
+func (c *collector) fallbacks() int {
+	n := 0
+	for _, s := range c.samples {
+		n += s.discarded
+	}
+	return n
+}
+
+// chunked reports whether any ledger arrived as a chunk flow — false for the
+// local mode, which has no stream and therefore no fallbacks to report.
+func (c *collector) chunked() bool {
+	for _, s := range c.samples {
+		if s.chunks > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // summary renders the run as plain text.
@@ -98,14 +142,25 @@ func (c *collector) summary() string {
 	}
 	out += percentileLine("inter-arrival", c.interArrivals())
 
-	ds := c.deliveries()
-	if len(ds) == 0 {
+	if ds := c.deliveries(); len(ds) == 0 {
 		out += "delivery     no emit stamps in this mode (nothing to measure against)\n"
-		return out
+	} else {
+		if emits := c.emits(); len(emits) > 0 {
+			out += percentileLine("t_emit", emits)
+		}
+		out += percentileLine("delivery", ds)
+		if ps := c.pipelines(); len(ps) > 0 {
+			out += percentileLine("pipeline", ps)
+		}
+		if missing := len(c.samples) - len(ds); missing > 0 {
+			out += fmt.Sprintf("             %d ledger(s) excluded: replayed from retention, no emit stamp\n", missing)
+		}
 	}
-	out += percentileLine("delivery", ds)
-	if missing := len(c.samples) - len(ds); missing > 0 {
-		out += fmt.Sprintf("             %d ledger(s) excluded: replayed from retention, no emit stamp\n", missing)
+	if c.chunked() {
+		// Stated even at zero: the acceptance gate is zero fallbacks, so the
+		// report has to show the count was measured, not merely omitted.
+		out += fmt.Sprintf("fallbacks    %d partial deliveries discarded (live flow abandoned, ring redelivered)\n",
+			c.fallbacks())
 	}
 	return out
 }
@@ -152,24 +207,34 @@ func fmtDur(d time.Duration) string {
 // writeCSV writes one row per ledger.
 func (c *collector) writeCSV(w io.Writer) error {
 	cw := csv.NewWriter(w)
-	if err := cw.Write([]string{"sequence", "bytes", "since_start_ns", "inter_arrival_ns", "delivery_ns"}); err != nil {
+	header := []string{
+		"sequence", "bytes", "chunks", "since_start_ns", "inter_arrival_ns",
+		"emit_ns", "delivery_ns", "pipeline_ns", "discarded_partials",
+	}
+	if err := cw.Write(header); err != nil {
 		return err
+	}
+	optional := func(d time.Duration, ok bool) string {
+		if !ok {
+			return ""
+		}
+		return strconv.FormatInt(d.Nanoseconds(), 10)
 	}
 	for i, s := range c.samples {
 		var gap time.Duration
 		if i > 0 {
 			gap = s.sinceStart - c.samples[i-1].sinceStart
 		}
-		delivery := ""
-		if s.hasDelivery {
-			delivery = strconv.FormatInt(s.delivery.Nanoseconds(), 10)
-		}
 		row := []string{
 			strconv.FormatUint(uint64(s.seq), 10),
 			strconv.Itoa(s.bytes),
+			strconv.Itoa(s.chunks),
 			strconv.FormatInt(s.sinceStart.Nanoseconds(), 10),
 			strconv.FormatInt(gap.Nanoseconds(), 10),
-			delivery,
+			optional(s.emit, s.hasEmit),
+			optional(s.delivery, s.hasDelivery),
+			optional(s.pipeline, s.hasPipeline),
+			strconv.Itoa(s.discarded),
 		}
 		if err := cw.Write(row); err != nil {
 			return err
