@@ -95,13 +95,23 @@ func newEncoder(concurrency, chunkSize int) (*zstd.Encoder, error) {
 		zstd.WithEncoderCRC(false))
 }
 
-// encodeChunk frames one chunk message into dst, compressing the payload when
-// that makes it smaller. dst is a scratch buffer the caller reuses, sized so
-// neither codec grows it; the returned slice aliases it.
+// compressChunk frames a compressed CHUNK message into dst, reporting false
+// when the frame is not smaller than the payload it wraps — in which case dst
+// holds nothing worth sending and the caller should ship the bytes verbatim.
+// dst is a scratch buffer the caller reuses, sized so the frame never grows
+// it; the returned slice aliases it.
+func compressChunk(enc *zstd.Encoder, dst []byte, seq, idx uint32, raw []byte) ([]byte, bool) {
+	header := wire.AppendChunkHeader(dst[:0], seq, idx, wire.CodecZstd)
+	msg := enc.EncodeAll(raw, header)
+	return msg, len(msg)-len(header) < len(raw)
+}
+
+// encodeChunk frames one chunk message into dst, compressing when that makes
+// it smaller. It is the copying form, for callers with no framed buffer of
+// their own to write into — the retention ring, which holds a whole ledger.
 func encodeChunk(enc *zstd.Encoder, dst []byte, seq, idx uint32, raw []byte) []byte {
 	if enc != nil {
-		header := wire.AppendChunkHeader(dst[:0], seq, idx, wire.CodecZstd)
-		if msg := enc.EncodeAll(raw, header); len(msg)-len(header) < len(raw) {
+		if msg, smaller := compressChunk(enc, dst, seq, idx, raw); smaller {
 			return msg
 		}
 	}
@@ -178,8 +188,16 @@ func newChunkPipeline(enc *zstd.Encoder, workers, chunkSize int, fallbacks *atom
 			// (measured 47% slower for the sake of 29 bytes).
 			scratch := make([]byte, 0, wire.ChunkHeaderSize+enc.MaxEncodedSize(chunkSize))
 			for job := range p.work {
-				msg := encodeChunk(enc, scratch, job.seq, job.idx, job.msg[wire.ChunkHeaderSize:])
-				job.out = bytes.Clone(msg)
+				msg, smaller := compressChunk(enc, scratch, job.seq, job.idx, job.msg[wire.ChunkHeaderSize:])
+				if smaller {
+					job.out = bytes.Clone(msg)
+				} else {
+					// Incompressible: frame the source's own buffer in place,
+					// the way submit's fallback does, rather than copying the
+					// payload into scratch and then out again.
+					wire.PutChunkHeader(job.msg, job.seq, job.idx, wire.CodecRaw)
+					job.out = job.msg
+				}
 				close(job.done)
 			}
 		}()

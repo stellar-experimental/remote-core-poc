@@ -251,6 +251,12 @@ func runLoopback(ctx context.Context, o options) (*collector, error) {
 	if err != nil {
 		return c, err
 	}
+	// A live chunk shipped uncompressed because every encoder was busy is
+	// invisible to the client — the codec is per chunk — so the only place it
+	// can be reported is here, from the server this mode owns.
+	if n := srv.RawFallbacks(); n > 0 {
+		fmt.Printf("raw fallbacks %d chunks shipped uncompressed (every encoder busy)\n", n)
+	}
 	stopSource()
 	return c, <-sourceDone
 }
@@ -308,8 +314,15 @@ func consume(
 		c.add(time.Now(), s)
 	}))
 
-	expected := make([]byte, o.syntheticSize)
+	// Sized from what actually arrived, so a --synthetic-size mismatch cannot
+	// report a healthy stream as corrupt in the same words real corruption
+	// would use; the length check that matters is the END frame's totalLen,
+	// which the client already enforces.
+	var expected []byte
 	for raw, err := range stream.RawLedgers(ctx, rng) {
+		if len(expected) != len(raw) {
+			expected = make([]byte, len(raw))
+		}
 		if err != nil {
 			return c, err
 		}
