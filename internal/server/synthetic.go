@@ -79,6 +79,12 @@ func SyntheticPayload(seq uint32, size int) []byte {
 
 // FillSyntheticPayload writes ledger seq's payload into buf. The first four
 // bytes carry the sequence; the rest is a stream seeded by it.
+//
+// The payload is PCG output, so it is INCOMPRESSIBLE by construction. That
+// makes this source a negative control for chunk compression — every chunk
+// falls back to CodecRaw — and useless for measuring compression's benefit.
+// Measure that against real meta: the pipe source running stellar-core, or
+// the file source replaying a captured dump.
 func FillSyntheticPayload(buf []byte, seq uint32) {
 	if len(buf) >= 4 {
 		binary.BigEndian.PutUint32(buf[:4], seq)

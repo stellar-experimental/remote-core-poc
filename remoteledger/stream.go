@@ -376,6 +376,13 @@ func (s *Stream) stream(
 		discarded int
 	}{}
 	hasher := xxhash.New()
+	dec, derr := newDecoder(s.maxChunkSize)
+	if derr != nil {
+		yield(nil, fmt.Errorf("remoteledger: %w", derr))
+		return
+	}
+	defer dec.Close()
+	var chunkScratch []byte // expansion buffer, reused across chunks
 	track := seqTracker{expected: ledgerRange.From()}
 
 	for {
@@ -437,13 +444,24 @@ func (s *Stream) stream(
 					ErrProtocol, m.Seq, m.ChunkIndex, asm.chunks))
 				return
 			}
-			if s.maxPayloadSize >= 0 && int64(len(asm.buf))+int64(len(m.Payload)) > s.maxPayloadSize {
+			before := len(asm.buf)
+			raw, derr := appendChunkPayload(dec, asm.buf, m.Payload, m.Codec, &chunkScratch)
+			if derr != nil {
+				yield(nil, fmt.Errorf("%w: ledger %d chunk %d: %w", ErrProtocol, m.Seq, m.ChunkIndex, derr))
+				return
+			}
+			asm.buf = raw
+			// The cap is checked against the EXPANDED size — a compressed
+			// chunk's payload says nothing about how much it becomes, and the
+			// cap exists to bound assembly memory.
+			if s.maxPayloadSize >= 0 && int64(len(asm.buf)) > s.maxPayloadSize {
 				yield(nil, fmt.Errorf("%w: ledger %d exceeds the %d-byte payload cap",
 					ErrProtocol, m.Seq, s.maxPayloadSize))
 				return
 			}
-			_, _ = hasher.Write(m.Payload) // xxhash's Write cannot fail
-			asm.buf = append(asm.buf, m.Payload...)
+			// The checksum covers the ledger's RAW bytes whatever each chunk's
+			// codec was, so hash what was appended, not what arrived.
+			_, _ = hasher.Write(asm.buf[before:]) // xxhash's Write cannot fail
 			asm.chunks++
 
 		case wire.TypeEnd:

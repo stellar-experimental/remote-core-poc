@@ -61,9 +61,11 @@ type options struct {
 	dataDir     string
 	logLevel    string
 
-	chunkSize  int
-	emitWindow time.Duration
-	cadence    time.Duration
+	chunkSize       int
+	compress        bool
+	compressWorkers int
+	emitWindow      time.Duration
+	cadence         time.Duration
 
 	coreBinary        string
 	coreConfig        string
@@ -93,6 +95,11 @@ func parseFlags(out io.Writer, args []string) (options, error) {
 	fs.StringVar(&o.logLevel, "log-level", "info", "log level: debug|info|warn|error")
 
 	fs.IntVar(&o.chunkSize, "chunk-size", wire.DefaultChunkSize, "chunk payload bytes")
+	fs.BoolVar(&o.compress, "compress", true,
+		"compress each chunk with zstd when that shrinks it (real meta compresses ~7.5x, which is "+
+			"what lets a ledger's transfer finish inside the source's emission window on one TCP flow)")
+	fs.IntVar(&o.compressWorkers, "compress-workers", 0,
+		"chunks compressed concurrently (0 = 4, sized to stay ahead of core's pipe drain)")
 	fs.DurationVar(&o.emitWindow, "emit-window", 15*time.Millisecond,
 		"pace each file/synthetic ledger's bytes over this window (0 = all at once; ignored for captive)")
 	fs.DurationVar(&o.cadence, "cadence", 600*time.Millisecond,
@@ -327,11 +334,13 @@ func run() error {
 	}
 
 	srv, err := server.New(server.Config{
-		Source:    source,
-		ChunkSize: o.chunkSize,
-		Range:     rng,
-		Store:     ring,
-		Logger:    logger,
+		Source:          source,
+		ChunkSize:       o.chunkSize,
+		Compress:        o.compress,
+		CompressWorkers: o.compressWorkers,
+		Range:           rng,
+		Store:           ring,
+		Logger:          logger,
 	})
 	if err != nil {
 		return err

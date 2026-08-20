@@ -50,7 +50,7 @@ Each ledger is a flow of binary messages:
 
 ```
 BEGIN [1B ver=0x02][1B type=0x10][4B BE seq][8B BE emitStartUnixNano]
-CHUNK [1B ver=0x02][1B type=0x11][4B BE seq][4B BE chunkIdx][payload bytes]
+CHUNK [1B ver=0x02][1B type=0x11][4B BE seq][4B BE chunkIdx][1B codec][payload]
 END   [1B ver=0x02][1B type=0x12][4B BE seq][4B BE chunkCount]
       [8B BE totalLen][8B BE emitEndUnixNano][8B BE xxhash64-of-raw]
 ```
@@ -194,9 +194,55 @@ Read the runs together: `local` says how fast ledgers can be produced at all, `r
 
 The retention ring has no run identity: after a restart over a stale `--data-dir`, ledgers the previous run retained are served as history until the new source's first publish resets the ring — a subscriber connecting in that window can receive the old run's bytes spliced with the new run's, checksum-clean on both sides. Clear the data dir (or use a fresh one) when changing sources or start ledgers.
 
-Deliberately absent: **compression** (the documented option for small-NIC receivers, where the wire time exceeds the emission window; its codec adds ~2–6 ms of tail, strictly worse on c6id-class NICs), TLS and auth (plaintext), gRPC (WebSocket was chosen to avoid a protoc/buf toolchain on every box; a gRPC variant is a follow-up if WebSocket framing shows up in the numbers), Prometheus metrics on the server (structured logs and `/healthz` instead), any parsing of ledger bodies (the seam carries opaque bytes end to end), verbatim-frame-reuse coupling with RPC storage, multi-subscriber scale-out beyond keeping the source-loop invariants, and multi-node retention replication.
+Deliberately absent: TLS and auth (plaintext), gRPC (WebSocket was chosen to avoid a protoc/buf toolchain on every box; a gRPC variant is a follow-up if WebSocket framing shows up in the numbers), Prometheus metrics on the server (structured logs and `/healthz` instead), any parsing of ledger bodies (the seam carries opaque bytes end to end), verbatim-frame-reuse coupling with RPC storage, multi-subscriber scale-out beyond keeping the source-loop invariants, and multi-node retention replication.
 
 Synthetic payloads are **not** valid `LedgerCloseMeta` XDR. Nothing in this prototype decodes a ledger body, so a deterministic blob is enough — and being deterministic is what lets the benchmark verify integrity by regenerating the bytes (`--verify`).
+
+## Compression
+
+Each chunk ships zstd-compressed when that shrinks it (`--compress`, on by
+default), flagged per chunk so an incompressible payload travels verbatim.
+It is not an optimisation — without it this transport cannot meet its
+latency target on any EC2 instance:
+
+A single WebSocket is a single TCP flow, and EC2 caps one flow at ~5 Gbit/s
+outside a cluster placement group (~10 inside) — measured on two
+c6id.8xlarge at 4.96 Gbit/s for one flow and 12.26 Gbit/s across four. A
+14.48 MiB ledger therefore needs ~24 ms of wire, against a source emission
+window measured at ~7.5 ms, so most of the transfer cannot hide behind
+emission. Real pubnet meta compresses **7.58x** per 256 KiB chunk (measured
+over 64 real ledgers; synthetic sac-6000 meta gives 7.08x), which puts the
+same ledger at ~2 MB and ~3.2 ms of wire — inside the window, with the link
+rate no longer governing delivery.
+
+Measured end to end on one box, real `stellar-core apply-load` at sac-6000
+shape through `--source pipe`, over a 5 Gbit/s single-flow link emulation:
+
+| | delivery p50 | p90 |
+|---|---|---|
+| `--compress=false` | 17.94 ms | 18.73 ms |
+| `--compress=true` | **1.65 ms** | 4.34 ms |
+
+Compression runs ONCE per chunk, not once per subscriber: the broadcaster
+publishes one immutable message every subscriber writes to its own socket,
+so the cost is flat in fan-out — and fan-out is what needs it most, since
+one subscriber alone would need 16.2 Gbit/s to hide an uncompressed
+transfer, more than the whole NIC.
+
+Implementation notes: the encoders are a run-scoped worker pool that
+publishes in submission order; a submission that would wait for a busy
+encoder is framed raw inline instead, so compression never back-pressures
+the source loop into core's meta pipe. The client expands each frame into a
+reused scratch buffer, and END's length and checksum always describe the RAW
+ledger, so integrity checking is identical whatever each chunk chose.
+
+The codec is pure-Go `klauspost/compress` rather than the cgo libzstd
+wrapper stellar-rpc v2 uses (that package is `internal/`, so it cannot be
+imported anyway). System libzstd at level 1 is ~2.5x faster per core
+(1,100 vs 451 MiB/s on real pubnet meta) and would cut the ~4 encoder cores
+this needs at stress density to ~1.7 — worth revisiting if the core box
+becomes CPU-bound, but not needed to meet the target, and it would cost this
+repo its pure-Go build.
 
 ## Tests
 

@@ -1,6 +1,10 @@
 package remoteledger
 
 import (
+	"math/rand"
+
+	"github.com/klauspost/compress/zstd"
+
 	"bytes"
 	"context"
 	"errors"
@@ -54,7 +58,7 @@ func sendFlow(ctx context.Context, conn *websocket.Conn, seq uint32, emitStart, 
 	for i, p := range pieces {
 		hasher.Write(p)
 		total += len(p)
-		send(ctx, conn, wire.AppendChunk(nil, seq, uint32(i), p))
+		send(ctx, conn, wire.AppendChunk(nil, seq, uint32(i), wire.CodecRaw, p))
 	}
 	send(ctx, conn, wire.AppendEnd(nil, seq, uint32(len(pieces)), uint64(total), emitEnd, hasher.Sum64()))
 }
@@ -297,7 +301,7 @@ func TestRawLedgersTruncatedMidAssembly(t *testing.T) {
 	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
 		sendFlow(ctx, conn, 1, 0, 0, []byte("whole"))
 		send(ctx, conn, wire.AppendBegin(nil, 2, 0))
-		send(ctx, conn, wire.AppendChunk(nil, 2, 0, []byte("partial")))
+		send(ctx, conn, wire.AppendChunk(nil, 2, 0, wire.CodecRaw, []byte("partial")))
 		_ = conn.Close(websocket.StatusNormalClosure, "source ended")
 	})
 	r := drain(t.Context(), New(url), ledgerbackend.BoundedRange(1, 3))
@@ -320,7 +324,7 @@ func TestRawLedgersUnboundedCloseMidAssemblyIsAnError(t *testing.T) {
 	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
 		sendFlow(ctx, conn, 1, 0, 0, []byte("whole"))
 		send(ctx, conn, wire.AppendBegin(nil, 2, 0))
-		send(ctx, conn, wire.AppendChunk(nil, 2, 0, []byte("partial")))
+		send(ctx, conn, wire.AppendChunk(nil, 2, 0, wire.CodecRaw, []byte("partial")))
 		_ = conn.Close(websocket.StatusNormalClosure, "source ended")
 	})
 	r := drain(t.Context(), New(url), ledgerbackend.UnboundedRange(1))
@@ -438,8 +442,8 @@ func TestRawLedgersDiscardsPartialOnRingRedelivery(t *testing.T) {
 	// discard count and no stamps.
 	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
 		send(ctx, conn, wire.AppendBegin(nil, 9, time.Now().UnixNano()))
-		send(ctx, conn, wire.AppendChunk(nil, 9, 0, []byte("partial that must v")))
-		send(ctx, conn, wire.AppendChunk(nil, 9, 1, []byte("anish")))
+		send(ctx, conn, wire.AppendChunk(nil, 9, 0, wire.CodecRaw, []byte("partial that must v")))
+		send(ctx, conn, wire.AppendChunk(nil, 9, 1, wire.CodecRaw, []byte("anish")))
 		sendFlow(ctx, conn, 9, 0, 0, []byte("the complete"), []byte(" ledger"))
 	})
 
@@ -473,31 +477,31 @@ func TestRawLedgersProtocolViolations(t *testing.T) {
 	}{
 		{"chunk out of order", func(ctx context.Context, conn *websocket.Conn) {
 			send(ctx, conn, wire.AppendBegin(nil, 1, 0))
-			send(ctx, conn, wire.AppendChunk(nil, 1, 1, []byte("x")))
+			send(ctx, conn, wire.AppendChunk(nil, 1, 1, wire.CodecRaw, []byte("x")))
 		}, "expected chunk 0"},
 		{"chunk without a flow", func(ctx context.Context, conn *websocket.Conn) {
-			send(ctx, conn, wire.AppendChunk(nil, 1, 0, []byte("x")))
+			send(ctx, conn, wire.AppendChunk(nil, 1, 0, wire.CodecRaw, []byte("x")))
 		}, "outside its flow"},
 		{"chunk for another ledger", func(ctx context.Context, conn *websocket.Conn) {
 			send(ctx, conn, wire.AppendBegin(nil, 1, 0))
-			send(ctx, conn, wire.AppendChunk(nil, 2, 0, []byte("x")))
+			send(ctx, conn, wire.AppendChunk(nil, 2, 0, wire.CodecRaw, []byte("x")))
 		}, "outside its flow"},
 		{"end without a flow", func(ctx context.Context, conn *websocket.Conn) {
 			send(ctx, conn, wire.AppendEnd(nil, 1, 0, 0, 0, 0))
 		}, "outside its flow"},
 		{"chunk count mismatch", func(ctx context.Context, conn *websocket.Conn) {
 			send(ctx, conn, wire.AppendBegin(nil, 1, 0))
-			send(ctx, conn, wire.AppendChunk(nil, 1, 0, []byte("x")))
+			send(ctx, conn, wire.AppendChunk(nil, 1, 0, wire.CodecRaw, []byte("x")))
 			send(ctx, conn, wire.AppendEnd(nil, 1, 2, 1, 0, xxhash.Sum64([]byte("x"))))
 		}, "declares 2 chunks"},
 		{"length mismatch", func(ctx context.Context, conn *websocket.Conn) {
 			send(ctx, conn, wire.AppendBegin(nil, 1, 0))
-			send(ctx, conn, wire.AppendChunk(nil, 1, 0, []byte("x")))
+			send(ctx, conn, wire.AppendChunk(nil, 1, 0, wire.CodecRaw, []byte("x")))
 			send(ctx, conn, wire.AppendEnd(nil, 1, 1, 2, 0, xxhash.Sum64([]byte("x"))))
 		}, "declares 2 bytes"},
 		{"checksum mismatch", func(ctx context.Context, conn *websocket.Conn) {
 			send(ctx, conn, wire.AppendBegin(nil, 1, 0))
-			send(ctx, conn, wire.AppendChunk(nil, 1, 0, []byte("x")))
+			send(ctx, conn, wire.AppendChunk(nil, 1, 0, wire.CodecRaw, []byte("x")))
 			send(ctx, conn, wire.AppendEnd(nil, 1, 1, 1, 0, 0xbad))
 		}, "checksum mismatch"},
 		{"truncated header", func(ctx context.Context, conn *websocket.Conn) {
@@ -563,8 +567,8 @@ func TestRawLedgersAssemblyCap(t *testing.T) {
 	t.Run("over the cap", func(t *testing.T) {
 		url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
 			send(ctx, conn, wire.AppendBegin(nil, 1, 0))
-			send(ctx, conn, wire.AppendChunk(nil, 1, 0, bytes.Repeat([]byte{1}, 100)))
-			send(ctx, conn, wire.AppendChunk(nil, 1, 1, bytes.Repeat([]byte{2}, 100)))
+			send(ctx, conn, wire.AppendChunk(nil, 1, 0, wire.CodecRaw, bytes.Repeat([]byte{1}, 100)))
+			send(ctx, conn, wire.AppendChunk(nil, 1, 1, wire.CodecRaw, bytes.Repeat([]byte{2}, 100)))
 		})
 		r := drain(t.Context(), New(url, WithMaxMessageSize(150)), ledgerbackend.UnboundedRange(1))
 		if !errors.Is(r.err, ErrProtocol) {
@@ -591,7 +595,7 @@ func TestRawLedgersAssemblyCap(t *testing.T) {
 func TestRawLedgersChunkOverTheReadLimitIsRejected(t *testing.T) {
 	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
 		send(ctx, conn, wire.AppendBegin(nil, 1, 0))
-		send(ctx, conn, wire.AppendChunk(nil, 1, 0, bytes.Repeat([]byte{1}, 8<<10)))
+		send(ctx, conn, wire.AppendChunk(nil, 1, 0, wire.CodecRaw, bytes.Repeat([]byte{1}, 8<<10)))
 	})
 	r := drain(t.Context(), New(url, WithMaxChunkSize(4<<10)), ledgerbackend.UnboundedRange(1))
 	if r.err == nil {
@@ -786,5 +790,66 @@ func TestEndpoint(t *testing.T) {
 				t.Errorf("endpoint = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestStreamExpandsCompressedChunks pins the client half of the codec
+// contract: a flow whose chunks arrive zstd-framed must yield the identical
+// raw ledger, with the checksum — which covers the RAW bytes — still
+// verifying, and a mixed-codec flow (the shape an opportunistic server
+// actually produces) must assemble just the same.
+func TestStreamExpandsCompressedChunks(t *testing.T) {
+	compressible := bytes.Repeat([]byte("meta-"), 20000) // 100 KB, shrinks hard
+	random := make([]byte, 40000)
+	rng := rand.New(rand.NewSource(3))
+	rng.Read(random) // will not shrink: server ships it raw
+	want := append(append([]byte(nil), compressible...), random...)
+
+	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer enc.Close()
+
+	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
+		send(ctx, conn, wire.AppendBegin(nil, 5, time.Now().UnixNano()))
+		// chunk 0 compressed, chunk 1 raw — the mixed case.
+		send(ctx, conn, wire.AppendChunk(nil, 5, 0, wire.CodecZstd, enc.EncodeAll(compressible, nil)))
+		send(ctx, conn, wire.AppendChunk(nil, 5, 1, wire.CodecRaw, random))
+		send(ctx, conn, wire.AppendEnd(nil, 5, 2, uint64(len(want)),
+			time.Now().UnixNano(), xxhash.Sum64(want)))
+	})
+
+	var got []byte
+	var count int
+	for raw, err := range New(url).RawLedgers(t.Context(), ledgerbackend.BoundedRange(5, 5)) {
+		if err != nil {
+			t.Fatalf("stream error: %v", err)
+		}
+		got = append([]byte(nil), raw...)
+		count++
+	}
+	if count != 1 {
+		t.Fatalf("yielded %d ledgers, want 1", count)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("assembled %d bytes, want %d — expansion or ordering wrong", len(got), len(want))
+	}
+}
+
+// TestStreamRejectsCorruptCompressedChunk pins that a malformed zstd frame is
+// a protocol error, not a panic or a silent short ledger.
+func TestStreamRejectsCorruptCompressedChunk(t *testing.T) {
+	url := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
+		send(ctx, conn, wire.AppendBegin(nil, 5, time.Now().UnixNano()))
+		send(ctx, conn, wire.AppendChunk(nil, 5, 0, wire.CodecZstd, []byte("not a zstd frame")))
+		send(ctx, conn, wire.AppendEnd(nil, 5, 1, 16, time.Now().UnixNano(), 0))
+	})
+	var gotErr error
+	for _, err := range New(url).RawLedgers(t.Context(), ledgerbackend.BoundedRange(5, 5)) {
+		gotErr = err
+	}
+	if !errors.Is(gotErr, ErrProtocol) {
+		t.Fatalf("error = %v, want ErrProtocol", gotErr)
 	}
 }

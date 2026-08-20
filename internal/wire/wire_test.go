@@ -23,7 +23,7 @@ func TestBeginRoundTrip(t *testing.T) {
 
 func TestChunkRoundTrip(t *testing.T) {
 	payload := []byte("one piece of a ledger")
-	msg := AppendChunk(nil, 7, 3, payload)
+	msg := AppendChunk(nil, 7, 3, CodecRaw, payload)
 	if len(msg) != ChunkHeaderSize+len(payload) {
 		t.Fatalf("CHUNK length = %d, want %d", len(msg), ChunkHeaderSize+len(payload))
 	}
@@ -47,11 +47,11 @@ func TestPutChunkHeaderMatchesAppendChunk(t *testing.T) {
 	// The in-place framing used by the hot path must produce the same bytes as
 	// the appending form, or the two would silently speak different dialects.
 	payload := []byte("payload read straight into the message")
-	appended := AppendChunk(nil, 9, 4, payload)
+	appended := AppendChunk(nil, 9, 4, CodecRaw, payload)
 
 	inPlace := make([]byte, ChunkHeaderSize+len(payload))
 	copy(inPlace[ChunkHeaderSize:], payload)
-	PutChunkHeader(inPlace, 9, 4)
+	PutChunkHeader(inPlace, 9, 4, CodecRaw)
 
 	if !bytes.Equal(appended, inPlace) {
 		t.Errorf("PutChunkHeader framing = %x, AppendChunk framing = %x", inPlace, appended)
@@ -59,7 +59,7 @@ func TestPutChunkHeaderMatchesAppendChunk(t *testing.T) {
 }
 
 func TestChunkEmptyPayload(t *testing.T) {
-	m, err := Decode(AppendChunk(nil, 1, 0, nil))
+	m, err := Decode(AppendChunk(nil, 1, 0, CodecRaw, nil))
 	if err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestDecodeErrors(t *testing.T) {
 
 	// 0x01 was the retired one-message-per-ledger protocol's version byte; a
 	// current decoder must refuse it like any other unknown version.
-	oldVersion := AppendChunk(nil, 1, 0, []byte("x"))
+	oldVersion := AppendChunk(nil, 1, 0, CodecRaw, []byte("x"))
 	oldVersion[0] = 0x01
 
 	badType := AppendBegin(nil, 1, 2)
@@ -109,7 +109,7 @@ func TestDecodeErrors(t *testing.T) {
 		{"shorter than any header", begin[:5], ErrShortMessage},
 		{"truncated BEGIN", begin[:BeginSize-1], ErrShortMessage},
 		{"oversized BEGIN", append(bytes.Clone(begin), 0), ErrShortMessage},
-		{"truncated CHUNK header", AppendChunk(nil, 1, 0, nil)[:ChunkHeaderSize-1], ErrShortMessage},
+		{"truncated CHUNK header", AppendChunk(nil, 1, 0, CodecRaw, nil)[:ChunkHeaderSize-1], ErrShortMessage},
 		{"truncated END", end[:EndSize-1], ErrShortMessage},
 		{"oversized END", append(bytes.Clone(end), 0), ErrShortMessage},
 		{"retired version byte", oldVersion, ErrVersion},
