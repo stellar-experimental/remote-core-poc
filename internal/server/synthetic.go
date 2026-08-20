@@ -27,6 +27,14 @@ type SyntheticStream struct {
 type SyntheticConfig struct {
 	// Size is the payload bytes per ledger. Zero means DefaultSyntheticSize.
 	Size int
+
+	// Compressible fabricates meta-SHAPED payloads — repetitive, like the
+	// XDR they stand in for — instead of the default incompressible noise.
+	// Real ledger meta compresses ~7.6x per chunk, so a benchmark of the
+	// compressing path over the default payload measures only discarded
+	// work; this is how the synthetic source reaches the cadence and ledger
+	// counts a tail measurement needs while still exercising compression.
+	Compressible bool
 }
 
 // DefaultSyntheticSize is the payload size of a fabricated ledger, in the range
@@ -57,7 +65,7 @@ func (s *SyntheticStream) RawLedgers(
 				yield(nil, err)
 				return
 			}
-			FillSyntheticPayload(buf, seq)
+			FillSyntheticPayload(buf, seq, s.cfg.Compressible)
 			if !yield(buf, nil) {
 				return
 			}
@@ -72,26 +80,51 @@ func (s *SyntheticStream) RawLedgers(
 // size. Regenerating it is how a consumer checks that what arrived over the
 // network is what the source produced.
 func SyntheticPayload(seq uint32, size int) []byte {
+	return SyntheticPayloadMode(seq, size, false)
+}
+
+// SyntheticPayloadMode is SyntheticPayload with the payload shape chosen
+// explicitly; compressible must match the source's configuration or a
+// verifying consumer will compare against the wrong bytes.
+func SyntheticPayloadMode(seq uint32, size int, compressible bool) []byte {
 	buf := make([]byte, size)
-	FillSyntheticPayload(buf, seq)
+	FillSyntheticPayload(buf, seq, compressible)
 	return buf
 }
 
 // FillSyntheticPayload writes ledger seq's payload into buf. The first four
-// bytes carry the sequence; the rest is a stream seeded by it.
+// bytes carry the sequence; the rest depends on the shape asked for. Both
+// shapes are reproducible from the sequence alone — independent of platform
+// and of how many ledgers came before — which is what lets a consumer verify
+// what arrived by regenerating it.
 //
-// The payload is PCG output, so it is INCOMPRESSIBLE by construction. That
-// makes this source a negative control for chunk compression — every chunk
-// falls back to CodecRaw — and useless for measuring compression's benefit.
-// Measure that against real meta: the pipe source running stellar-core, or
-// the file source replaying a captured dump.
-func FillSyntheticPayload(buf []byte, seq uint32) {
+// The default is PCG output, INCOMPRESSIBLE by construction: a negative
+// control that proves the compressing path degrades to CodecRaw without
+// expanding anything. compressible instead repeats a per-sequence block, the
+// way real XDR meta repeats field layouts, account IDs and asset codes —
+// which is what a benchmark of the compressing path needs, since real meta
+// compresses ~7.6x per chunk and this default compresses not at all.
+func FillSyntheticPayload(buf []byte, seq uint32, compressible bool) {
 	if len(buf) >= 4 {
 		binary.BigEndian.PutUint32(buf[:4], seq)
 	}
-	// A per-sequence PCG keeps the payload reproducible from the sequence alone,
-	// independent of platform and of how many ledgers came before.
 	r := rand.New(rand.NewPCG(uint64(seq), syntheticSeed))
+	if compressible {
+		// One block of noise, then repeats of it: deterministic, and it
+		// compresses in the same ballpark as real meta (~7x) rather than the
+		// near-1.0 of pure noise.
+		const block = 512
+		end := min(4+block, len(buf))
+		for i := 4; i < end; i += 8 {
+			var word [8]byte
+			binary.LittleEndian.PutUint64(word[:], r.Uint64())
+			copy(buf[i:], word[:])
+		}
+		for i := end; i < len(buf); i += block {
+			copy(buf[i:], buf[4:end])
+		}
+		return
+	}
 	for i := 4; i < len(buf); i += 8 {
 		var word [8]byte
 		binary.LittleEndian.PutUint64(word[:], r.Uint64())

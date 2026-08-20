@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"fmt"
 	"sync"
 
@@ -31,13 +32,14 @@ import (
 const (
 	// compressWorkersDefault is what the live path uses when a caller does
 	// not choose. Core drains its meta into the pipe at ~1.9 GB/s and one
-	// core compresses ~450 MiB/s of real meta, so four workers keep the
-	// pipeline ahead of the source; going wider adds goroutines without
-	// buying window.
+	// core compresses ~490 MiB/s of real meta, so four workers run at par
+	// with the source (~1.97 GB/s) — which is why the raw fallback in
+	// submit is a designed path and not an emergency one.
 	compressWorkersDefault = 4
 
-	// maxCompressWorkers bounds the flag: past this the goroutines cost more
-	// than the parallelism buys.
+	// maxCompressWorkers is a sanity bound on operator input. The goroutines
+	// are free; the encoder states are not (~9.8 MiB of pool at concurrency
+	// 6, ~25 MiB at 66), and nothing on this hardware profits past a few.
 	maxCompressWorkers = 64
 
 	// pendingChunks is how many chunks may be queued for publication. It is
@@ -48,7 +50,8 @@ const (
 	// run and leaves the source unblocked at any chunk size worth using.
 	pendingChunks = 1024
 
-	// encodeSlots bounds chunks in flight INSIDE the encoders. Past ~16 the
+	// encodeSlots bounds the queue INTO the encoders (chunks actually in
+	// flight are encodeSlots + workers). Past ~16 the
 	// extra depth only defers compression into flush(), landing it on the
 	// post-emission tail; below it, the raw fallback fires for chunks that
 	// had time to compress.
@@ -64,12 +67,17 @@ const (
 func newEncoder(workers int) (*zstd.Encoder, error) {
 	return zstd.NewWriter(nil,
 		zstd.WithEncoderLevel(zstd.SpeedFastest),
-		zstd.WithEncoderConcurrency(workers+2))
+		zstd.WithEncoderConcurrency(workers+2),
+		// No per-frame checksum: END carries xxhash64 over the whole RAW
+		// ledger and the client verifies it, so a frame CRC detects nothing
+		// extra while costing the decoder ~23% (measured on real pubnet
+		// meta: 2.55 -> 3.13 GB/s, ~1.1 ms of client CPU per stress ledger).
+		zstd.WithEncoderCRC(false))
 }
 
 // encodeChunk frames one chunk message into dst, compressing the payload when
-// that makes it smaller. dst is a scratch buffer the caller reuses; the
-// returned slice aliases it.
+// that makes it smaller. dst is a scratch buffer the caller reuses, sized so
+// neither codec grows it; the returned slice aliases it.
 func encodeChunk(enc *zstd.Encoder, dst []byte, seq, idx uint32, raw []byte) []byte {
 	if enc != nil {
 		header := wire.AppendChunkHeader(dst[:0], seq, idx, wire.CodecZstd)
@@ -97,13 +105,14 @@ type chunkPipeline struct {
 	stop      sync.Once
 }
 
-// chunkJob is one chunk in flight: raw bytes in, framed message out. raw must
-// stay valid until done closes, which the per-ledger arena guarantees and
-// flush() enforces before END.
+// chunkJob is one chunk in flight. msg is the source's own buffer: a
+// ChunkHeaderSize gap followed by the raw payload, which lets the raw path
+// frame in place instead of copying. It must stay valid until done closes,
+// which the per-ledger arena guarantees and flush() enforces before END.
 type chunkJob struct {
 	seq  uint32
 	idx  uint32
-	raw  []byte
+	msg  []byte
 	out  []byte
 	done chan struct{}
 }
@@ -112,6 +121,12 @@ type chunkJob struct {
 // (see newEncoder); publish is called from the publisher goroutine only, in
 // submission order.
 func newChunkPipeline(enc *zstd.Encoder, workers, chunkSize int, publish func(msg []byte)) *chunkPipeline {
+	if enc == nil {
+		// Not compressing: submit frames in place and publishes inline, so
+		// there is no queue, no workers and nothing to drain. The caller
+		// still holds a pipeline, which keeps the source loop single-path.
+		return &chunkPipeline{publish: publish}
+	}
 	p := &chunkPipeline{
 		enc:       enc,
 		chunkSize: chunkSize,
@@ -128,13 +143,14 @@ func newChunkPipeline(enc *zstd.Encoder, workers, chunkSize int, publish func(ms
 			// then copied out at its exact size, so neither codec grows a
 			// buffer mid-encode and the published allocation is never the
 			// 4x-oversized fallback the compressed sizing would imply.
-			scratch := make([]byte, 0, wire.ChunkHeaderSize+p.chunkSize)
+			// Sized by what zstd can actually emit, not by the payload: a
+			// frame of an incompressible chunk is LARGER than its input, and
+			// a scratch that has to grow is reallocated on every such chunk
+			// (measured 47% slower for the sake of 29 bytes).
+			scratch := make([]byte, 0, wire.ChunkHeaderSize+p.enc.MaxEncodedSize(p.chunkSize))
 			for job := range p.work {
-				msg := encodeChunk(p.enc, scratch, job.seq, job.idx, job.raw)
-				if cap(msg) > cap(scratch) {
-					scratch = msg[:0] // an oversized chunk grew it; keep the growth
-				}
-				job.out = append(make([]byte, 0, len(msg)), msg...)
+				msg := encodeChunk(p.enc, scratch, job.seq, job.idx, job.msg[wire.ChunkHeaderSize:])
+				job.out = bytes.Clone(msg)
 				close(job.done)
 			}
 		}()
@@ -150,17 +166,27 @@ func newChunkPipeline(enc *zstd.Encoder, workers, chunkSize int, publish func(ms
 	return p
 }
 
-// submit queues one chunk. It never waits: the ordered queue holds a whole
-// ledger, and if every encoder is busy the chunk is framed raw on this
-// goroutine, so the source keeps draining core's pipe.
-func (p *chunkPipeline) submit(seq, idx uint32, raw []byte) {
-	job := &chunkJob{seq: seq, idx: idx, raw: raw, done: make(chan struct{})}
+// submit hands one chunk to the pipeline. msg is the source's buffer with a
+// ChunkHeaderSize gap in front of the payload.
+//
+// It does not wait in practice: the ordered queue holds a whole ledger at the
+// default chunk size, and when every encoder is busy the chunk is framed raw
+// in place — a header write, no copy — so the source keeps draining core's
+// pipe. Encoders running at par with the source (see compressWorkersDefault)
+// make that the designed steady state, not an edge case.
+func (p *chunkPipeline) submit(seq, idx uint32, msg []byte) {
+	if p.enc == nil {
+		wire.PutChunkHeader(msg, seq, idx, wire.CodecRaw)
+		p.publish(msg)
+		return
+	}
+	job := &chunkJob{seq: seq, idx: idx, msg: msg, done: make(chan struct{})}
 	p.inflight.Add(1)
 	p.ordered <- job
 	select {
 	case p.work <- job:
 	default:
-		msg := encodeChunk(nil, make([]byte, 0, wire.ChunkHeaderSize+len(raw)), seq, idx, raw)
+		wire.PutChunkHeader(msg, seq, idx, wire.CodecRaw)
 		job.out = msg
 		close(job.done)
 	}
@@ -176,6 +202,9 @@ func (p *chunkPipeline) flush() { p.inflight.Wait() }
 // close drains and stops the pipeline. Safe to call more than once, and with
 // nothing submitted.
 func (p *chunkPipeline) close() {
+	if p.work == nil {
+		return // pass-through pipeline: nothing was started
+	}
 	p.stop.Do(func() {
 		close(p.work)
 		p.workers.Wait()

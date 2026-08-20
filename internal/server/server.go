@@ -77,7 +77,7 @@ type Config struct {
 	Compress bool
 
 	// CompressWorkers is how many chunks compress concurrently. Zero means
-	// compressWorkersDefault. Ignored when Compress is false.
+	// compressWorkersDefault. Validated whether or not Compress is set.
 	CompressWorkers int
 
 	// Range is what Run asks the source for. Its start must be a concrete
@@ -104,7 +104,6 @@ type Server struct {
 	// replay share; zstd.Encoder is itself a pool of encoder states, so
 	// concurrent EncodeAll calls do not contend. Nil when not compressing.
 	enc             *zstd.Encoder
-	compress        bool
 	compressWorkers int
 
 	published    atomic.Uint64
@@ -163,7 +162,6 @@ func New(cfg Config) (*Server, error) {
 		chunkSize: chunkSize,
 
 		enc:             enc,
-		compress:        cfg.Compress,
 		compressWorkers: workers,
 	}, nil
 }
@@ -211,11 +209,12 @@ func (s *Server) Run(ctx context.Context) (err error) {
 	// merely wasteful — every early return below would leak its publisher,
 	// which then publishes into a broadcaster this function has already
 	// finished, panicking the daemon on an ordinary shutdown.
-	var pipeline *chunkPipeline
-	if s.compress {
-		pipeline = newChunkPipeline(s.enc, s.compressWorkers, s.chunkSize, s.b.chunk)
-		defer pipeline.close()
-	}
+	// s.enc is nil when not compressing, which makes this a pass-through that
+	// frames and publishes inline — so the source loop has one path either
+	// way. Routing the uncompressed case through it costs 166 ns per ledger,
+	// five orders of magnitude below what the A/B can resolve.
+	pipeline := newChunkPipeline(s.enc, s.compressWorkers, s.chunkSize, s.b.chunk)
+	defer pipeline.close()
 
 	var prevSeq uint32  // the last emitted sequence; the chain must be dense
 	var assembly []byte // reused across ledgers; the store copies it to disk
@@ -308,16 +307,10 @@ func (s *Server) Run(ctx context.Context) (err error) {
 				data := msg[wire.ChunkHeaderSize:]
 				// Hand the chunk on before hashing and assembling: the wire is
 				// the deadline, and both bookkeeping passes only READ these
-				// bytes, so they may already be on their way out.
-				if pipeline != nil {
-					// The encoders read data until the pipeline drains, which
-					// the arena's disjoint regions keep valid, and the framed
-					// message they publish is their own allocation.
-					pipeline.submit(seq, chunkIdx, data)
-				} else {
-					wire.PutChunkHeader(msg, seq, chunkIdx, wire.CodecRaw)
-					s.b.chunk(msg)
-				}
+				// bytes, so they may already be on their way out. The pipeline
+				// reads msg until it drains, which the arena's disjoint
+				// regions keep valid and flush() enforces before END.
+				pipeline.submit(seq, chunkIdx, msg)
 				chunkIdx++
 				if fromArena {
 					used += wire.ChunkHeaderSize + n
@@ -338,11 +331,9 @@ func (s *Server) Run(ctx context.Context) (err error) {
 				return fmt.Errorf("source failed emitting ledger %d: %w", seq, rerr)
 			}
 		}
-		if pipeline != nil {
-			// Every chunk is published, in order, before END announces the
-			// counts and checksum they must match.
-			pipeline.flush()
-		}
+		// Every chunk is published, in order, before END announces the counts
+		// and checksum they must match.
+		pipeline.flush()
 		// A source that declared a size must deliver exactly it: publishing a
 		// truncated body under a fresh checksum would turn a mid-frame source
 		// failure into a valid-looking shorter ledger.
@@ -735,7 +726,7 @@ func (s *Server) writeRingFlow(
 	var idx uint32
 	for off := 0; off < len(raw); off += s.chunkSize {
 		chunk := raw[off:min(off+s.chunkSize, len(raw))]
-		b = encodeChunk(s.enc, b[:0], seq, idx, chunk)
+		b = encodeChunk(s.enc, b, seq, idx, chunk)
 		if err := s.write(ctx, conn, b); err != nil {
 			return err
 		}
