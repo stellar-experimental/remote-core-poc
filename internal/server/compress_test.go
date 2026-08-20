@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -54,7 +55,7 @@ func expand(t *testing.T, m wire.Message) []byte {
 // verbatim under CodecRaw rather than paying to inflate, and either way the
 // bytes a receiver recovers are exactly the bytes that went in.
 func TestEncodeChunkRoundTrips(t *testing.T) {
-	enc, err := newEncoder(2)
+	enc, err := newEncoder(4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,12 +105,13 @@ func TestEncodeChunkRoundTrips(t *testing.T) {
 func TestChunkPipelinePublishesInOrder(t *testing.T) {
 	const chunks = 64
 	var got [][]byte
-	penc, err := newEncoder(4)
+	penc, err := newEncoder(6)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer penc.Close()
-	p := newChunkPipeline(penc, 4, 256<<10, func(msg []byte) {
+	var fallbacks atomic.Uint64
+	p := newChunkPipeline(penc, 4, 256<<10, &fallbacks, func(msg []byte) {
 		got = append(got, append([]byte(nil), msg...))
 	})
 	// Payloads of wildly different compressibility make the workers finish out
@@ -155,16 +157,12 @@ func TestChunkPipelinePublishesInOrder(t *testing.T) {
 // broadcaster's finish, and the next publish double-closed the notify channel
 // — panicking the daemon on an ordinary SIGINT.
 func TestRunWithCompressionSurvivesEarlyReturn(t *testing.T) {
-	ring, err := store.Open(filepath.Join(t.TempDir(), "ledgers"), 100)
-	if err != nil {
-		t.Fatal(err)
-	}
 	// A source that fails partway: the failure path is the one that skipped
 	// the pipeline's cleanup.
 	srv, err := New(Config{
 		Source:   failingSource{err: errors.New("source died mid-flow")},
 		Range:    ledgerbackend.UnboundedRange(1),
-		Store:    ring,
+		Store:    mustStore(t),
 		Compress: true,
 	})
 	if err != nil {
@@ -236,4 +234,37 @@ func TestCompressedFlowRoundTripsThroughClient(t *testing.T) {
 			t.Fatalf("ring-replayed ledger %d differs", i+1)
 		}
 	}
+}
+
+// TestRingReplaysDoNotStarveLivePath pins the invariant the shared-encoder
+// simplification broke: "nothing a subscriber does can slow the source loop".
+// zstd.Encoder is a fixed pool of encoder states and EncodeAll BLOCKS when
+// they are all borrowed, so a ring replay drawing from the live pool made
+// live chunks fall back to raw — 13% of chunks at 8 catch-up subscribers,
+// 37% at 16. Separate encoders is what keeps that at zero.
+func TestRingReplaysDoNotStarveLivePath(t *testing.T) {
+	srv, err := New(Config{
+		Source:   scriptedSource{seqs: []uint32{1}},
+		Range:    ledgerbackend.UnboundedRange(1),
+		Store:    mustStore(t),
+		Compress: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if srv.enc == srv.ringEnc {
+		t.Fatal("live and ring replays share one encoder pool — a catch-up subscriber can throttle the source")
+	}
+	if srv.ringEnc == nil {
+		t.Fatal("compressing server has no ring encoder")
+	}
+}
+
+func mustStore(t *testing.T) *store.Store {
+	t.Helper()
+	ring, err := store.Open(filepath.Join(t.TempDir(), "ledgers"), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ring
 }

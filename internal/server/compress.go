@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/klauspost/compress/zstd"
 
@@ -50,6 +51,11 @@ const (
 	// run and leaves the source unblocked at any chunk size worth using.
 	pendingChunks = 1024
 
+	// ringEncoderConcurrency is how many retention-ring replays may compress
+	// at once. Replays are throughput work, not latency work: queueing among
+	// themselves is fine, and each state costs ~256 KiB, so this stays small.
+	ringEncoderConcurrency = 2
+
 	// encodeSlots bounds the queue INTO the encoders (chunks actually in
 	// flight are encodeSlots + workers). Past ~16 the
 	// extra depth only defers compression into flush(), landing it on the
@@ -58,16 +64,21 @@ const (
 	encodeSlots = 16
 )
 
-// newEncoder builds the shared encoder: SpeedFastest, since the pipeline must
-// stay ahead of the source, and a concurrency of workers+2 because
-// zstd.Encoder is itself a pool of encoder states gated by a channel —
-// EncodeAll borrows one per call, so the live workers and the retention-ring
-// replays share this one object without contending for the same state, and
-// the +2 keeps a replay from starving the live path.
-func newEncoder(workers int) (*zstd.Encoder, error) {
+// newEncoder builds an encoder with room for concurrency concurrent
+// EncodeAll calls. zstd.Encoder is itself a pool of encoder states gated by a
+// channel — EncodeAll BLOCKS when they are all borrowed — so this number is
+// not a hint: it is how many callers can encode at once.
+//
+// That is why the live pipeline and the retention ring get SEPARATE encoders.
+// Sharing one made a subscriber able to slow the source loop, which the
+// server's whole shape exists to prevent: catch-up replays borrowed states
+// the live workers then waited for, so live chunks took submit's raw fallback
+// — measured 13% of chunks at 8 catch-up subscribers, 37% at 16, precisely
+// when the link is busiest and compression matters most.
+func newEncoder(concurrency int) (*zstd.Encoder, error) {
 	return zstd.NewWriter(nil,
 		zstd.WithEncoderLevel(zstd.SpeedFastest),
-		zstd.WithEncoderConcurrency(workers+2),
+		zstd.WithEncoderConcurrency(concurrency),
 		// No per-frame checksum: END carries xxhash64 over the whole RAW
 		// ledger and the client verifies it, so a frame CRC detects nothing
 		// extra while costing the decoder ~23% (measured on real pubnet
@@ -94,7 +105,12 @@ func encodeChunk(enc *zstd.Encoder, dst []byte, seq, idx uint32, raw []byte) []b
 // wasteful — every early return in the source loop would leak its publisher,
 // which then publishes into a broadcaster that Run has already finished.
 type chunkPipeline struct {
-	enc       *zstd.Encoder
+	enc *zstd.Encoder
+	// fallbacks counts chunks shipped raw because every encoder was busy.
+	// Silent degradation is the failure mode this path has: the codec is per
+	// chunk, so a flow that quietly stops compressing looks identical on the
+	// wire to one that never needed to.
+	fallbacks *atomic.Uint64
 	chunkSize int
 	work      chan *chunkJob
 	ordered   chan *chunkJob
@@ -120,7 +136,7 @@ type chunkJob struct {
 // newChunkPipeline starts workers encoders and one publisher. enc is shared
 // (see newEncoder); publish is called from the publisher goroutine only, in
 // submission order.
-func newChunkPipeline(enc *zstd.Encoder, workers, chunkSize int, publish func(msg []byte)) *chunkPipeline {
+func newChunkPipeline(enc *zstd.Encoder, workers, chunkSize int, fallbacks *atomic.Uint64, publish func(msg []byte)) *chunkPipeline {
 	if enc == nil {
 		// Not compressing: submit frames in place and publishes inline, so
 		// there is no queue, no workers and nothing to drain. The caller
@@ -129,6 +145,7 @@ func newChunkPipeline(enc *zstd.Encoder, workers, chunkSize int, publish func(ms
 	}
 	p := &chunkPipeline{
 		enc:       enc,
+		fallbacks: fallbacks,
 		chunkSize: chunkSize,
 		work:      make(chan *chunkJob, encodeSlots),
 		ordered:   make(chan *chunkJob, pendingChunks),
@@ -189,6 +206,7 @@ func (p *chunkPipeline) submit(seq, idx uint32, msg []byte) {
 		wire.PutChunkHeader(msg, seq, idx, wire.CodecRaw)
 		job.out = msg
 		close(job.done)
+		p.fallbacks.Add(1)
 	}
 }
 

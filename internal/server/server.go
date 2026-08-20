@@ -104,7 +104,9 @@ type Server struct {
 	// replay share; zstd.Encoder is itself a pool of encoder states, so
 	// concurrent EncodeAll calls do not contend. Nil when not compressing.
 	enc             *zstd.Encoder
+	ringEnc         *zstd.Encoder // separate pool: replays must not throttle the source
 	compressWorkers int
+	rawFallbacks    atomic.Uint64
 
 	published    atomic.Uint64
 	subscribers  atomic.Int64
@@ -144,12 +146,16 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("server: %w", err)
 	}
-	var enc *zstd.Encoder
+	var enc, ringEnc *zstd.Encoder
 	if cfg.Compress {
 		// Built here rather than in Run so a bad configuration fails before
-		// the listener binds, not after the daemon reports itself up.
-		enc, err = newEncoder(workers)
-		if err != nil {
+		// the listener binds, not after the daemon reports itself up. The
+		// ring gets its own encoder: see newEncoder on why sharing one lets a
+		// subscriber throttle the source loop.
+		if enc, err = newEncoder(workers); err != nil {
+			return nil, fmt.Errorf("server: compression: %w", err)
+		}
+		if ringEnc, err = newEncoder(ringEncoderConcurrency); err != nil {
 			return nil, fmt.Errorf("server: compression: %w", err)
 		}
 	}
@@ -162,6 +168,7 @@ func New(cfg Config) (*Server, error) {
 		chunkSize: chunkSize,
 
 		enc:             enc,
+		ringEnc:         ringEnc,
 		compressWorkers: workers,
 	}, nil
 }
@@ -213,7 +220,7 @@ func (s *Server) Run(ctx context.Context) (err error) {
 	// frames and publishes inline — so the source loop has one path either
 	// way. Routing the uncompressed case through it costs 166 ns per ledger,
 	// five orders of magnitude below what the A/B can resolve.
-	pipeline := newChunkPipeline(s.enc, s.compressWorkers, s.chunkSize, s.b.chunk)
+	pipeline := newChunkPipeline(s.enc, s.compressWorkers, s.chunkSize, &s.rawFallbacks, s.b.chunk)
 	defer pipeline.close()
 
 	var prevSeq uint32  // the last emitted sequence; the chain must be dense
@@ -726,7 +733,7 @@ func (s *Server) writeRingFlow(
 	var idx uint32
 	for off := 0; off < len(raw); off += s.chunkSize {
 		chunk := raw[off:min(off+s.chunkSize, len(raw))]
-		b = encodeChunk(s.enc, b, seq, idx, chunk)
+		b = encodeChunk(s.ringEnc, b, seq, idx, chunk)
 		if err := s.write(ctx, conn, b); err != nil {
 			return err
 		}
@@ -748,6 +755,10 @@ type health struct {
 	Latest       uint32 `json:"latest"`
 	Subscribers  int    `json:"subscribers"`
 	LiveAbandons uint64 `json:"live_abandons"`
+	// RawFallbacks is live chunks shipped uncompressed because every encoder
+	// was busy. Non-zero means compression is silently degrading — the wire
+	// cost of a ledger rises without anything else changing.
+	RawFallbacks uint64 `json:"raw_fallbacks"`
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -758,6 +769,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		Latest:       latest,
 		Subscribers:  s.Subscribers(),
 		LiveAbandons: s.LiveAbandons(),
+		RawFallbacks: s.rawFallbacks.Load(),
 	}); err != nil {
 		s.log.Debug("healthz write failed", "error", err)
 	}
