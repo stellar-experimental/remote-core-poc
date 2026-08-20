@@ -103,18 +103,24 @@ func FillSyntheticPayload(buf []byte, seq uint32, compressible bool) {
 	}
 	r := rand.New(rand.NewPCG(uint64(seq), syntheticSeed))
 	if compressible {
-		// One block of noise, then repeats of it: deterministic, and it
-		// compresses in the same ballpark as real meta (~7x) rather than the
-		// near-1.0 of pure noise.
-		const block = 512
-		end := min(4+block, len(buf))
-		for i := 4; i < end; i += 8 {
-			var word [8]byte
-			binary.LittleEndian.PutUint64(word[:], r.Uint64())
-			copy(buf[i:], word[:])
+		// Meta-shaped: fixed-size records that share a template but carry
+		// their own entropy, the way real XDR repeats field layouts around
+		// per-transaction hashes and IDs. The entropy fraction — not the
+		// buffer length — sets the ratio, which is what keeps it near real
+		// meta's ~7.6x at ANY chunk size. A single repeated block instead
+		// compresses better the more of it you take (455x at a 256 KiB
+		// chunk), which silently turns a wire measurement into a no-op.
+		var template [recordSize]byte
+		for i := 0; i < len(template); i += 8 {
+			binary.LittleEndian.PutUint64(template[i:], r.Uint64())
 		}
-		for i := end; i < len(buf); i += block {
-			copy(buf[i:], buf[4:end])
+		for off := 4; off < len(buf); off += recordSize {
+			n := copy(buf[off:], template[:])
+			// The tail of each record is unique, so every record costs
+			// literal bytes no matter how many records the window holds.
+			for i := n - recordEntropy; i >= 0 && i+8 <= n; i += 8 {
+				binary.LittleEndian.PutUint64(buf[off+i:], r.Uint64())
+			}
 		}
 		return
 	}
@@ -125,7 +131,16 @@ func FillSyntheticPayload(buf []byte, seq uint32, compressible bool) {
 	}
 }
 
-const syntheticSeed = 0x5CE11A8
+const (
+	syntheticSeed = 0x5CE11A8
+
+	// recordSize and recordEntropy shape the compressible payload: a record
+	// of recordSize bytes whose last recordEntropy bytes are fresh noise. The
+	// ratio is bounded by recordSize/recordEntropy and measures ~7x, matching
+	// real ledger meta closely enough for a wire benchmark.
+	recordSize    = 256
+	recordEntropy = 32
+)
 
 // CountedRange builds a start-plus-count range: count ledgers from start, or
 // unbounded when count is zero. It is how the synthetic and file sources — the

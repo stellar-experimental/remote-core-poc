@@ -177,6 +177,11 @@ func New(cfg Config) (*Server, error) {
 // Subscribers is how many consumers are currently connected.
 func (s *Server) Subscribers() int { return int(s.subscribers.Load()) }
 
+// RawFallbacks is how many live chunks shipped uncompressed because every
+// encoder was busy. Non-zero means compression is silently degrading: the
+// codec is per chunk, so nothing else in the numbers moves when it happens.
+func (s *Server) RawFallbacks() uint64 { return s.rawFallbacks.Load() }
+
 // LiveAbandons is how many times a slow subscriber's live chunk flow was
 // abandoned in favour of a ring redelivery. A measurement window must show
 // zero of these: an abandoned ledger arrives complete but stampless, dropping
@@ -770,7 +775,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		Latest:       latest,
 		Subscribers:  s.Subscribers(),
 		LiveAbandons: s.LiveAbandons(),
-		RawFallbacks: s.rawFallbacks.Load(),
+		RawFallbacks: s.RawFallbacks(),
 	}); err != nil {
 		s.log.Debug("healthz write failed", "error", err)
 	}

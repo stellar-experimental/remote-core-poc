@@ -151,6 +151,12 @@ func newChunkPipeline(enc *zstd.Encoder, workers, chunkSize int, fallbacks *atom
 		// still holds a pipeline, which keeps the source loop single-path.
 		return &chunkPipeline{publish: publish}
 	}
+	if workers < 1 {
+		// Zero workers drains nothing: jobs queue, their done channels never
+		// close, and flush() blocks forever with no diagnostic. New validates
+		// this today, but the guard belongs with the loop that depends on it.
+		workers = compressWorkersDefault
+	}
 	p := &chunkPipeline{
 		fallbacks: fallbacks,
 		work:      make(chan *chunkJob, encodeSlots),

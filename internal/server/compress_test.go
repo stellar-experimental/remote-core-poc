@@ -349,3 +349,42 @@ func TestValidateCompressWorkers(t *testing.T) {
 		}
 	}
 }
+
+// TestCompressiblePayloadRatioIsChunkInvariant pins the calibration that a
+// benchmark depends on. The first version of this payload repeated one block,
+// so only the first was literal and the ratio grew with chunk size — 7.7x at
+// 4 KiB but 455x at the 256 KiB default, which quietly turned a wire
+// measurement into a no-op (33 KB per ledger instead of ~2 MB). Real meta
+// compresses ~7.6x whatever window you give it; this must too.
+func TestCompressiblePayloadRatioIsChunkInvariant(t *testing.T) {
+	buf := make([]byte, 4<<20)
+	FillSyntheticPayload(buf, 42, true)
+	for _, chunk := range []int{wire.MinChunkSize, 64 << 10, wire.DefaultChunkSize, 1 << 20} {
+		enc, err := newEncoder(1, chunk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		total := 0
+		for off := 0; off < len(buf); off += chunk {
+			total += len(enc.EncodeAll(buf[off:min(off+chunk, len(buf))], nil))
+		}
+		enc.Close()
+		ratio := float64(len(buf)) / float64(total)
+		// Real pubnet meta measures 7.58x per chunk; anything an order of
+		// magnitude off means the shape, not the codec, is being measured.
+		if ratio < 4 || ratio > 12 {
+			t.Errorf("chunk %d: ratio %.2fx is outside [4,12] — payload no longer models real meta", chunk, ratio)
+		}
+	}
+	// The incompressible default must stay incompressible, or the negative
+	// control stops controlling for anything.
+	FillSyntheticPayload(buf, 42, false)
+	enc, err := newEncoder(1, wire.DefaultChunkSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer enc.Close()
+	if ratio := float64(wire.DefaultChunkSize) / float64(len(enc.EncodeAll(buf[:wire.DefaultChunkSize], nil))); ratio > 1.1 {
+		t.Errorf("default payload compresses %.2fx — it is meant to be a negative control", ratio)
+	}
+}
