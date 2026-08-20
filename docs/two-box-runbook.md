@@ -87,12 +87,17 @@ measured against.
 
 - `delivery` is the headline (assembled-and-verified − emitEnd); `fallbacks`
   must be 0 in every cell.
-- If P1 lands 4–5 ms: the mechanism is working as measured; the gate as
-  written is the casualty. The design-relevant criterion is remote-vs-local
-  delta (local captive pays the same ~27 ms serialize + 7.5 ms drain before
-  decoding; remote's true penalty is the unhidden wire ≈ 2.2 ms + tail).
-  Decide between re-anchoring the gate and building the sized per-chunk
-  compression (~7× at >500 MiB/s, measured on the acceptance corpus itself —
-  the same SAC-shape meta the gate runs on).
+- If P1 misses the gate, rule out the two ways compression can be absent
+  before blaming the network. Check `/healthz`'s `raw_fallbacks`: non-zero
+  means chunks shipped uncompressed because every encoder state was busy —
+  raise `-compress-workers`, it is a CPU problem, not a protocol one. Then
+  check the bytes actually moved: ~2 MB per ledger means the payload
+  compressed, ~14.5 MB means `-synthetic-compressible` was left off and the
+  cell measured incompressible noise.
+- If P1 lands 4–5 ms with clean fallbacks and ~2 MB on the wire: the
+  mechanism is working as measured and the gate as written is the casualty.
+  The design-relevant criterion is remote-vs-local delta (local captive pays
+  the same ~27 ms serialize + 7.5 ms drain before decoding; remote's true
+  penalty is the unhidden wire ≈ 2.2 ms + tail).
 - If P1 exceeds ~5.5 ms: something outside the model (irq steering, placement,
   clock) — check `chronyc tracking`, `ethtool -S` coalescing, and rerun.
