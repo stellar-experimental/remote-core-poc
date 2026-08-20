@@ -346,16 +346,29 @@ func deliver(
 func readMessage(ctx context.Context, conn *websocket.Conn, buf *bytes.Buffer) error {
 	typ, reader, err := conn.Reader(ctx)
 	if err != nil {
-		return err
+		return cancelled(ctx, err)
 	}
 	if typ != websocket.MessageBinary {
 		return fmt.Errorf("%w: unexpected %v message", ErrProtocol, typ)
 	}
 	buf.Reset()
 	if _, err := buf.ReadFrom(reader); err != nil {
-		return fmt.Errorf("remoteledger: read message body: %w", err)
+		return cancelled(ctx, fmt.Errorf("remoteledger: read message body: %w", err))
 	}
 	return nil
+}
+
+// cancelled reports a stopped consumer as the cancellation, whatever the
+// transport happened to notice first. A blocked read is aborted by closing the
+// connection from another goroutine, so the read can lose that race and return
+// "use of closed network connection" — and a caller matching on
+// context.Canceled to tell its own shutdown from a broken stream would see a
+// hard failure instead.
+func cancelled(ctx context.Context, err error) error {
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	return err
 }
 
 // stream is the read loop: reassemble BEGIN/CHUNK*/END into the complete raw

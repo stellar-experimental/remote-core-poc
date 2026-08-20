@@ -853,3 +853,50 @@ func TestStreamRejectsCorruptCompressedChunk(t *testing.T) {
 		t.Fatalf("error = %v, want ErrProtocol", gotErr)
 	}
 }
+
+// TestCancelledBodyReadReportsTheCancellation pins the error a cancelled
+// consumer sees. coder/websocket aborts a blocked read by closing the
+// connection from another goroutine, so a read that loses that race reports
+// the transport's version of the story — "use of closed network connection" —
+// instead of the cancellation that caused it. A consumer matching on
+// context.Canceled to tell "I stopped it" from "the stream broke" would then
+// treat its own shutdown as a stream failure, once in a few hundred cancels.
+func TestCancelledBodyReadReportsTheCancellation(t *testing.T) {
+	sent := make(chan struct{})
+	endpoint := stub(t, func(ctx context.Context, conn *websocket.Conn, _ url.Values) {
+		w, err := conn.Writer(ctx, websocket.MessageBinary)
+		if err != nil {
+			return
+		}
+		// A megabyte overruns every buffer between here and the client, so
+		// this returns only once the client has consumed nearly all of it —
+		// and the message is never closed, leaving the client blocked in the
+		// body read, which is where the race lives.
+		if _, err := w.Write(make([]byte, 1<<20)); err != nil {
+			return
+		}
+		close(sent)
+		<-ctx.Done()
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	conn, _, err := websocket.Dial(ctx, endpoint, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.CloseNow()
+	conn.SetReadLimit(4 << 20) // the default 32 KiB would end the read first
+
+	read := make(chan error, 1)
+	go func() {
+		var buf bytes.Buffer
+		read <- readMessage(ctx, conn, &buf)
+	}()
+
+	<-sent
+	cancel()
+	conn.CloseNow() // the abort a cancelled read loses the race to
+
+	if err := <-read; !errors.Is(err, context.Canceled) {
+		t.Fatalf("body read after cancel = %v, want context.Canceled", err)
+	}
+}
