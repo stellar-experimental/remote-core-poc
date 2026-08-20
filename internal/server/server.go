@@ -1,13 +1,20 @@
-// Package server owns captive stellar-core (or a synthetic stand-in) on one
-// machine and streams its raw ledger XDR to remote subscribers over WebSocket.
+// Package server owns a ledger source — captive stellar-core, a file dump
+// replayer, or a synthetic stand-in — on one machine and streams its raw
+// ledger XDR to remote subscribers over WebSocket.
 //
-// A single source loop pulls ledgers from a ledgerbackend.LedgerStream, copies
-// each one out of the borrowed iterator slice, appends it to a retention ring
-// and moves the published tip forward. Each subscriber is a cursor over the
-// ring: it reads from the store while behind the tip and is woken when the tip
-// moves. Nothing a subscriber does can slow the source loop down, and a slow
-// subscriber is never disconnected for lagging — it catches back up from the
-// ring, and only falling out of retention entirely ends its stream.
+// A single source loop reads each ledger's bytes incrementally from the
+// source and publishes them as a chunk flow: the first chunk goes on the wire
+// while the source is still emitting the rest, which is what lets transfer
+// hide inside the source's own emission window. Each completed ledger is
+// appended to a retention ring on disk. Each subscriber is a cursor over the
+// ring: it reads from the store while behind the flow and is woken when the
+// flow grows. Nothing a subscriber does can slow the source loop down, and a
+// slow subscriber is never disconnected for lagging — it catches back up from
+// the ring, and only falling out of retention entirely ends its stream.
+//
+// The one-message-per-ledger v1 protocol this design replaced is gone from
+// the tree; measure it for a comparison row by building the pre-chunking
+// revision from git history on the same pairing.
 package server
 
 import (
@@ -15,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"net/http"
@@ -22,6 +30,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/coder/websocket"
 	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
 
@@ -29,23 +38,35 @@ import (
 	"github.com/stellar-experimental/remote-core-poc/internal/wire"
 )
 
-// writeTimeout bounds a single message write, and is the server's liveness
-// authority: a peer that vanished without a reset is noticed here once ledgers
-// flow, or by the OS's TCP keepalive surfacing through the handler's read side
-// while the stream is quiet. There is no WebSocket-level ping — a subscriber
-// stalled mid-iteration cannot pong, and disconnecting it for that would break
-// the promise that only falling out of retention ends a subscription.
-const writeTimeout = 2 * time.Minute
+// chunkWriteTimeout bounds a single message write, and is the server's
+// write-side liveness authority — and a real policy choice: a peer that
+// cannot drain one chunk within it is disconnected mid-write, because a
+// serve loop blocked inside conn.Write cannot observe the flow moving on and
+// fall back to the ring. The catch-up promise therefore holds for peers that
+// keep draining the socket, however slowly they consume; one frozen outright
+// with a chunk in flight is dropped after this bound rather than v1's two
+// minutes. There is no WebSocket-level ping: a subscriber stalled
+// mid-iteration cannot pong, and disconnecting it for that would break the
+// catch-up promise for the peers it does cover.
+const chunkWriteTimeout = 10 * time.Second
 
-// maxPayloadSize is the largest ledger the protocol can carry. It is a variable
-// only so tests can shrink it; the cap itself is protocol-defined, not an
-// operator setting, which is why no flag exposes it.
+// maxPayloadSize is the largest ledger the protocol can carry — the
+// assembly-buffer cap on both ends. It is a variable only so tests can shrink
+// it; the cap itself is protocol-defined, not an operator setting, which is
+// why no flag exposes it.
 var maxPayloadSize = wire.DefaultMaxPayloadSize
 
 // Config describes a server.
 type Config struct {
-	// Source supplies ledgers. It is consumed exactly once, by Run.
-	Source ledgerbackend.LedgerStream
+	// Source supplies ledgers as incremental emissions — the seam a real core
+	// meta pipe would plug into. Wrap a complete-ledger LedgerStream in
+	// PacedSource to adapt (and optionally pace) it. It is consumed exactly
+	// once, by Run.
+	Source EmittingStream
+
+	// ChunkSize is the chunk payload size ledgers are cut into on the wire.
+	// Zero means wire.DefaultChunkSize.
+	ChunkSize int
 
 	// Range is what Run asks the source for. Its start must be a concrete
 	// ledger: the server counts sequences from it.
@@ -60,14 +81,16 @@ type Config struct {
 
 // Server serves one source to many subscribers.
 type Server struct {
-	source ledgerbackend.LedgerStream
-	rng    ledgerbackend.Range
-	store  *store.Store
-	b      *broadcaster
-	log    *slog.Logger
+	source    EmittingStream
+	rng       ledgerbackend.Range
+	store     *store.Store
+	b         *broadcaster
+	log       *slog.Logger
+	chunkSize int
 
-	published   atomic.Uint64
-	subscribers atomic.Int64
+	published    atomic.Uint64
+	subscribers  atomic.Int64
+	liveAbandons atomic.Uint64
 }
 
 // New validates cfg and returns a server. It does not touch the source; Run
@@ -85,21 +108,38 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Range.Bounded() && cfg.Range.To() < cfg.Range.From() {
 		return nil, fmt.Errorf("server: source range %s ends before it starts", cfg.Range)
 	}
+	chunkSize := cfg.ChunkSize
+	if chunkSize == 0 {
+		chunkSize = wire.DefaultChunkSize
+	}
+	// The bounds are an interop contract, not a taste check: a chunk over
+	// wire.MaxChunkSize is rejected by every default-configured client's read
+	// limit, disconnecting all of them with an opaque framing error.
+	if err := wire.ValidateChunkSize(chunkSize); err != nil {
+		return nil, fmt.Errorf("server: %w", err)
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Server{
-		source: cfg.Source,
-		rng:    cfg.Range,
-		store:  cfg.Store,
-		b:      newBroadcaster(),
-		log:    logger,
+		source:    cfg.Source,
+		rng:       cfg.Range,
+		store:     cfg.Store,
+		b:         newBroadcaster(),
+		log:       logger,
+		chunkSize: chunkSize,
 	}, nil
 }
 
 // Subscribers is how many consumers are currently connected.
 func (s *Server) Subscribers() int { return int(s.subscribers.Load()) }
+
+// LiveAbandons is how many times a slow subscriber's live chunk flow was
+// abandoned in favour of a ring redelivery. A measurement window must show
+// zero of these: an abandoned ledger arrives complete but stampless, dropping
+// out of the delivery samples.
+func (s *Server) LiveAbandons() uint64 { return s.liveAbandons.Load() }
 
 // Handler returns the HTTP surface: the stream endpoint and /healthz.
 func (s *Server) Handler() http.Handler {
@@ -111,43 +151,149 @@ func (s *Server) Handler() http.Handler {
 
 // Run drives the source loop until the source ends, it fails, or ctx is
 // cancelled. It returns nil when a bounded source completed or when ctx was
-// cancelled. Call it once: a LedgerStream is consumed by a single goroutine.
+// cancelled. Call it once: a source is consumed by a single goroutine.
+//
+// The loop's shape is what makes overlap possible: each chunk is read from
+// the emission and published the moment it exists — no batching, no waiting
+// for the ledger to complete — and the disk write to the retention ring
+// happens AFTER the END is published, so a live subscriber's delivery never
+// pays for it. The flow stays in memory until the next ledger's BEGIN, so the
+// just-completed ledger is served from there; the ring only ever serves
+// ledgers older than the current flow, and each Put completes before the next
+// BEGIN — so those are always on disk by the time a cursor asks.
 //
 // When Run returns, every connected subscriber is finished off with a normal
 // close — there is nothing more to stream, and a subscriber waiting on a dead
 // source would hang.
-func (s *Server) Run(ctx context.Context) error {
-	defer s.b.finish()
+func (s *Server) Run(ctx context.Context) (err error) {
+	defer func() { s.b.finish(err) }()
 
-	seq := s.rng.From()
-	s.log.Info("source loop starting", "range", s.rng.String())
+	s.log.Info("source loop starting", "range", s.rng.String(), "chunk_size", s.chunkSize)
 
-	for raw, err := range s.source.RawLedgers(ctx, s.rng) {
+	var prevSeq uint32  // the last emitted sequence; the chain must be dense
+	var assembly []byte // reused across ledgers; the store copies it to disk
+	// spare is a fallback CHUNK message allocation for ledgers whose size the
+	// source did not declare. Once published it belongs to subscribers and a
+	// fresh one is allocated; a read that returns no data hands it back.
+	var spare []byte
+	hasher := xxhash.New()
+
+	for em, err := range s.source.Emissions(ctx, s.rng) {
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
 				s.log.Info("source loop cancelled", "ledgers", s.published.Load())
 				return nil
 			}
-			return fmt.Errorf("source failed at ledger %d: %w", seq, err)
+			return fmt.Errorf("source failed at ledger %d: %w", em.Seq, err)
 		}
+		seq := em.Seq
+		// Sources that carry their own sequences (the pipe tap parses them out
+		// of the metas) can skip or rewind — core re-emitting after a
+		// catchup->live handoff, say. The ring's own answer to a break in the
+		// chain is to unlink everything it holds, so refuse here instead: a
+		// visible failure beats silently discarding retained history.
+		if prevSeq != 0 && seq != prevSeq+1 {
+			return fmt.Errorf("source emitted ledger %d after %d: sequences must be dense and ascending", seq, prevSeq)
+		}
+		prevSeq = seq
 
-		// A ledger no subscriber could read is a failure here, not something to
-		// hand out: every client's read limit is the protocol cap, so publishing
-		// past it would disconnect all of them with a framing error instead of
-		// telling the operator what is wrong. The SDK caps captive-core frames at
-		// 256 MiB, so this fires only on a misconfigured synthetic source or a
-		// future source with a larger frame.
-		if int64(len(raw)) > maxPayloadSize {
+		// A ledger no subscriber could assemble is a failure here, not
+		// something to hand out: every client's assembly cap is the protocol
+		// cap, so streaming past it would disconnect all of them with a
+		// protocol error instead of telling the operator what is wrong.
+		if em.Size > maxPayloadSize {
 			return fmt.Errorf("ledger %d is %d bytes, over the %d-byte protocol payload cap",
-				seq, len(raw), maxPayloadSize)
+				seq, em.Size, maxPayloadSize)
 		}
 
-		// One allocation holds the header and our copy of the borrowed slice; the
-		// store persists the copy, the broadcaster hands out the whole message.
-		msg := wire.AppendLedger(make([]byte, 0, wire.HeaderSize+len(raw)), seq, time.Now().UnixNano(), raw)
-		payload := msg[wire.HeaderSize:]
+		assembly = assembly[:0]
+		if int64(cap(assembly)) < em.Size {
+			assembly = make([]byte, 0, em.Size)
+		}
+		hasher.Reset()
 
-		reset, err := s.store.Put(seq, payload)
+		// arena holds every chunk message of this ledger in one allocation.
+		// Published messages are immutable and the broadcaster pins the whole
+		// flow until the next BEGIN anyway, so a per-ledger arena preserves
+		// both while collapsing ~58 per-chunk allocations per stress ledger —
+		// GC assists that would land on the measured post-emission tail — into
+		// one. Chunks are carved as disjoint regions; a read's unused slack
+		// beyond n falls inside the NEXT region, which is framed only after
+		// its own read overwrites it, so no published bytes are ever touched.
+		var arena []byte
+		used := 0
+		if em.Size > 0 {
+			headers := (int(em.Size)/s.chunkSize + 2) * wire.ChunkHeaderSize
+			arena = make([]byte, int(em.Size)+headers)
+		}
+
+		// The stamp is the emission's start: the source hands the emission
+		// over as it begins producing, and T_emit, the delivery metric's
+		// anchor, and tip subscriptions all count from here. Publishing BEGIN
+		// before the first read also keeps the stamp honest when that read
+		// blocks for a whole pacing window (the single-chunk case, where
+		// stamping after it would collapse T_emit to ~0 and delivery back to
+		// store-and-forward). A zero-byte ledger keeps BEGIN/END paired.
+		s.b.begin(seq, wire.AppendBegin(make([]byte, 0, wire.BeginSize), seq, time.Now().UnixNano()))
+
+		var chunkIdx uint32
+		for {
+			var buf []byte
+			fromArena := len(arena)-used >= wire.ChunkHeaderSize+1
+			if fromArena {
+				buf = arena[used:min(used+wire.ChunkHeaderSize+s.chunkSize, len(arena))]
+			} else {
+				// The size hint ran short (or was absent): standalone
+				// allocations carry the overflow.
+				if spare == nil {
+					spare = make([]byte, wire.ChunkHeaderSize+s.chunkSize)
+				}
+				buf = spare
+			}
+			n, rerr := em.Body.Read(buf[wire.ChunkHeaderSize:])
+			if n > 0 {
+				if int64(len(assembly))+int64(n) > maxPayloadSize {
+					return fmt.Errorf("ledger %d ran past the %d-byte protocol payload cap mid-emission",
+						seq, maxPayloadSize)
+				}
+				msg := buf[:wire.ChunkHeaderSize+n]
+				wire.PutChunkHeader(msg, seq, chunkIdx)
+				// Publish before hashing and assembling: the wire is the
+				// deadline, and both bookkeeping passes only read the message,
+				// so subscribers may share it already.
+				s.b.chunk(msg)
+				chunkIdx++
+				if fromArena {
+					used += wire.ChunkHeaderSize + n
+				} else {
+					spare = nil
+				}
+				data := msg[wire.ChunkHeaderSize:]
+				_, _ = hasher.Write(data) // xxhash's Write cannot fail
+				assembly = append(assembly, data...)
+			}
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(rerr, ctxErr) {
+					s.log.Info("source loop cancelled", "ledgers", s.published.Load())
+					return nil
+				}
+				return fmt.Errorf("source failed emitting ledger %d: %w", seq, rerr)
+			}
+		}
+		// A source that declared a size must deliver exactly it: publishing a
+		// truncated body under a fresh checksum would turn a mid-frame source
+		// failure into a valid-looking shorter ledger.
+		if em.Size > 0 && int64(len(assembly)) != em.Size {
+			return fmt.Errorf("ledger %d body is %d bytes, source declared %d",
+				seq, len(assembly), em.Size)
+		}
+		s.b.end(wire.AppendEnd(make([]byte, 0, wire.EndSize), seq, chunkIdx,
+			uint64(len(assembly)), time.Now().UnixNano(), hasher.Sum64()))
+
+		reset, err := s.store.Put(seq, assembly)
 		if err != nil {
 			return fmt.Errorf("retain ledger %d: %w", seq, err)
 		}
@@ -155,21 +301,19 @@ func (s *Server) Run(ctx context.Context) error {
 			s.log.Warn("retention reset: ledger does not continue the retained range", "ledger", seq)
 		}
 
-		s.b.publish(liveLedger{seq: seq, msg: msg})
 		s.published.Add(1)
 		if seq%100 == 0 {
 			oldest, latest, _ := s.store.Bounds()
-			s.log.Info("streaming", "ledger", seq, "bytes", len(payload),
+			s.log.Info("streaming", "ledger", seq, "bytes", len(assembly), "chunks", chunkIdx,
 				"retained_oldest", oldest, "retained_latest", latest, "subscribers", s.Subscribers())
 		}
-		seq++
 	}
 
 	if err := ctx.Err(); err != nil {
 		s.log.Info("source loop cancelled", "ledgers", s.published.Load())
 		return nil
 	}
-	s.log.Info("source exhausted", "ledgers", s.published.Load(), "next_ledger", seq)
+	s.log.Info("source exhausted", "ledgers", s.published.Load())
 	return nil
 }
 
@@ -226,7 +370,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := websocket.Accept(w, r, nil)
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		// Explicitly no permessage-deflate: a codec in the hot path adds
+		// milliseconds of tail on the hardware this targets, and compression is
+		// this design's documented small-NIC alternative, not a default.
+		CompressionMode: websocket.CompressionDisabled,
+	})
 	if err != nil {
 		s.log.Warn("websocket handshake failed", "remote", r.RemoteAddr, "error", err)
 		return
@@ -255,101 +404,224 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// serve runs one subscription as a cursor over the retention ring: read from
-// the store while behind, write the in-memory tip message when the cursor is
-// exactly the tip, otherwise sleep until the tip moves. Catch-up is not a
-// separate phase — it is what the loop does whenever the cursor is behind,
-// including right after connecting. That is also why a subscriber that stalls
-// is never disconnected for lagging: the ledgers it missed are read back from
-// the ring, and only falling out of retention ends the subscription.
+// anchorTip resolves a start-at-tip subscription against the current flow: an
+// in-flight ledger can still be joined from its first chunk, a completed one
+// is history and the subscription starts after it. Zero means the flow has
+// not begun and the cursor stays unanchored.
+func (s *Server) anchorTip() uint64 {
+	snap, _, _ := s.b.watch()
+	if snap.seq() == 0 {
+		return 0
+	}
+	if snap.complete() {
+		return uint64(snap.seq()) + 1
+	}
+	return uint64(snap.seq())
+}
+
+// readRing fetches ledger next from the retention ring — serve's catch-up
+// path. ok is false with no error when the ring cannot serve next
+// yet (nothing retained, or next is beyond the retained range): the caller
+// sleeps on the flow. A ledger missing INSIDE the bounds was pruned, so the
+// subscriber is too far behind; tooFar carries the close reason for
+// wire.StatusTooFarBehind.
+func (s *Server) readRing(next uint64) (raw []byte, ok bool, tooFar string, err error) {
+	if _, latest, filled := s.store.Bounds(); !filled || next > uint64(latest) {
+		return nil, false, "", nil
+	}
+	raw, err = s.store.Get(uint32(next))
+	if err != nil {
+		if errors.Is(err, store.ErrNotRetained) {
+			// Off the ring's old edge, whether at connect or because pruning
+			// caught up with the cursor.
+			oldest, latest, _ := s.store.Bounds()
+			return nil, false, wire.TooFarBehindReason(oldest, latest), nil
+		}
+		return nil, false, "", err
+	}
+	return raw, true, "", nil
+}
+
+// endedClose is the close for a subscriber whose source has finished with
+// nothing more to send it. A bounded subscriber still waiting on ledgers is
+// being cut short, not served; saying so on the wire keeps the close honest,
+// though the client does not depend on it — it compares what arrived against
+// what it asked for.
+func endedClose(req streamRequest, next uint64) (websocket.StatusCode, string) {
+	if req.bounded && next <= uint64(req.end) {
+		return websocket.StatusGoingAway, "source ended before range complete"
+	}
+	return websocket.StatusNormalClosure, "source ended"
+}
+
+// serve runs one subscription as a cursor over the retention ring plus
+// the live chunk flow: follow the flow chunk-by-chunk when the cursor is
+// exactly there, read complete ledgers from the store while behind, otherwise
+// sleep until the flow grows. Catch-up is not a separate phase — it is what
+// the loop does whenever the cursor is behind, including right after
+// connecting. A subscriber that stalls is never disconnected for lagging: the
+// ledgers it missed are read back from the ring, and only falling out of
+// retention ends the subscription.
+//
+// The slow-subscriber policy lives here too: a subscriber mid-chunks when the
+// flow moves on to the next ledger has spent its budget — the rest of that
+// ledger's emission — so its live flow is abandoned and the ledger is
+// redelivered complete (and stampless) from the ring; the client discards its
+// partial assembly on the fresh BEGIN. One refinement: a subscriber that had
+// every chunk and was owed only the END is finished from the pinned flow
+// instead — abandoning it would be a spurious fallback charged to a
+// watch-gap, not to slowness. The source loop never notices any of this,
+// which is the invariant that keeps one slow consumer from hurting the rest.
 //
 // It returns the close code to send, or an error when the connection is
 // already broken and a close handshake is pointless.
 func (s *Server) serve(
 	ctx context.Context, conn *websocket.Conn, req streamRequest,
 ) (websocket.StatusCode, string, error) {
-	// next is the sequence the subscriber expects, one past the last write. It
-	// is a uint64 so serving the last representable ledger leaves it one past
-	// math.MaxUint32 instead of wrapping to 0 and re-reading the ring. Zero
-	// means the tip subscription, not yet anchored to a sequence.
+	// next is the sequence the subscriber expects. It is a uint64 so serving
+	// the last representable ledger leaves it one past math.MaxUint32 instead
+	// of wrapping to 0 and re-reading the ring. Zero means the tip
+	// subscription, not yet anchored to a sequence.
 	next := uint64(req.start)
-
-	// A tip subscription starts after the tip observed at connect. When nothing
-	// has been published yet it stays unanchored, and the loop anchors it to
-	// the source's first ledger instead.
 	if next == 0 {
-		if tip, _, _ := s.b.watch(); tip.seq != 0 {
-			next = uint64(tip.seq) + 1
-		}
+		next = s.anchorTip()
 	}
 
-	// buf is the scratch a ring read is framed into. It grows to the largest
-	// ledger served and is then reused; a subscriber that never falls behind
-	// never allocates it.
+	// live tracks progress through the flow the subscriber is mid-way into.
+	// While begun holds, next stays pinned to the begun flow's ledger, and f
+	// pins the flow object itself so a flow the broadcaster has moved past can
+	// still be finished from memory.
+	var live struct {
+		f     *flow
+		begun bool // BEGIN written, END not yet
+		sent  int  // chunks written
+	}
+
+	// buf is the scratch ring reads are framed into; it grows to one chunk
+	// message and is then reused. A subscriber that never falls behind never
+	// allocates it.
 	var buf []byte
 
 	for {
-		tip, changed, ended := s.b.watch()
+		snap, changed, ended := s.b.watch()
 		if next == 0 {
-			next = uint64(tip.seq) // the source's first ledger, or still unanchored
+			next = uint64(snap.seq()) // the source's first ledger, or still unanchored
 		}
 		if next != 0 && req.bounded && next > uint64(req.end) {
 			return websocket.StatusNormalClosure, "", nil
 		}
 
-		// Pick the message the cursor calls for: the shared in-memory tip when
-		// the cursor is exactly there (the only copy that carries an emit
-		// stamp), a ring read while behind it, nil when there is nothing to
-		// send yet. Once the source has published, ring reads happen only
-		// below the tip: Put and publish strictly alternate, so the ring's
-		// latest is at most one past the tip, and that one ledger's stamped
-		// publish is already in flight — sleeping on the captured channel
-		// hands it out from memory instead of racing it to disk. Before the
-		// first publish the ring alone decides: after a restart it holds
-		// history the source has not re-published, and that must be served
-		// rather than waited on.
-		var msg []byte
-		if next == uint64(tip.seq) && next != 0 {
-			msg = tip.msg
-		} else if next != 0 && (next < uint64(tip.seq) || tip.seq == 0) {
-			if _, latest, filled := s.store.Bounds(); filled && next <= uint64(latest) {
-				raw, err := s.store.Get(uint32(next))
-				if err != nil {
-					if errors.Is(err, store.ErrNotRetained) {
-						// Off the ring's old edge, whether at connect or
-						// because pruning caught up with the cursor: this
-						// subscriber is too far behind.
-						oldest, l, _ := s.store.Bounds()
-						return wire.StatusTooFarBehind, wire.TooFarBehindReason(oldest, l), nil
-					}
+		if next != 0 && next == uint64(snap.seq()) {
+			if !live.begun && snap.complete() {
+				// The subscriber reached this flow only after it finished: the
+				// flow is history to it, not a live delivery, so it is served
+				// from memory with ZEROED stamps — handing a late arrival the
+				// original stamps would record the flow's age (up to a whole
+				// cadence) as a delivery latency and poison the measurement.
+				// The chunk messages themselves are shared; only the tiny
+				// BEGIN/END are re-framed.
+				if err := s.writeStamplessFlow(ctx, conn, snap, &buf); err != nil {
 					return 0, "", err
 				}
-				// A ledger served from the ring carries no emit stamp: the
-				// arrival time is not persisted, and the time we read the file
-				// is not a delivery latency.
-				buf = wire.AppendLedger(buf[:0], uint32(next), 0, raw)
-				msg = buf
+				next++
+				continue
 			}
-		}
-
-		if msg != nil {
-			if err := s.write(ctx, conn, msg); err != nil {
+			// The live flow: write whatever this snapshot holds beyond what has
+			// already been sent, then re-watch — more may have been published
+			// while these writes were in flight.
+			wrote := false
+			if !live.begun || live.f != snap.f {
+				// A DIFFERENT flow object carrying the same sequence is a
+				// fresh emission of that ledger (core re-emitting N across a
+				// catchup->live handoff or restart), not a continuation of
+				// the one being written: re-BEGIN so the client discards its
+				// partial, instead of splicing two bodies under one END.
+				if err := s.write(ctx, conn, snap.f.begin); err != nil {
+					return 0, "", err
+				}
+				live.f, live.begun, live.sent = snap.f, true, 0
+				wrote = true
+			}
+			for live.sent < len(snap.chunks) {
+				if err := s.write(ctx, conn, snap.chunks[live.sent]); err != nil {
+					return 0, "", err
+				}
+				live.sent++
+				wrote = true
+			}
+			if snap.complete() {
+				if err := s.write(ctx, conn, snap.end); err != nil {
+					return 0, "", err
+				}
+				live.f, live.begun = nil, false
+				next++
+				continue
+			}
+			if wrote {
+				continue
+			}
+			// Nothing new in this snapshot: fall through to sleep on the flow.
+		} else if next != 0 && (next < uint64(snap.seq()) || snap.seq() == 0) {
+			// Behind the flow: serve from the ring. Once the source has
+			// published, everything below the current flow is on disk — each
+			// Put completes before the next BEGIN. Before the first publish the
+			// ring alone decides: after a restart it holds history the source
+			// has not re-published, and that must be served rather than waited
+			// on.
+			if live.begun {
+				// The flow the subscriber is inside was replaced. The pinned
+				// flow object is complete and safe to read without the lock:
+				// a new flow can only begin after this one's END was published
+				// (begin panics otherwise), and observing the newer flow in
+				// snap ordered that publish before us.
+				if f := live.f; live.sent == len(f.chunks) && f.end != nil {
+					// Only the 34-byte END was outstanding — the subscriber
+					// received every chunk live, so finish the ledger from the
+					// pinned flow with its real stamps instead of charging a
+					// full stampless ring redelivery for a watch-gap that
+					// merely spanned END-publish + disk write + next BEGIN.
+					if err := s.write(ctx, conn, f.end); err != nil {
+						return 0, "", err
+					}
+					live.f, live.begun = nil, false
+					next++
+					continue
+				}
+				// Mid-chunks: the budget — the rest of the ledger's emission —
+				// is spent. Abandon the live delivery; the ring redelivers it
+				// complete, and the fresh BEGIN below is what tells the client
+				// to discard its partial.
+				live.f, live.begun = nil, false
+				s.liveAbandons.Add(1)
+				s.log.Debug("live chunk flow abandoned; redelivering from the ring", "ledger", next)
+			}
+			raw, ok, tooFar, err := s.readRing(next)
+			if err != nil {
 				return 0, "", err
 			}
-			next++
-			continue
+			if tooFar != "" {
+				return wire.StatusTooFarBehind, tooFar, nil
+			}
+			if ok {
+				if err := s.writeRingFlow(ctx, conn, uint32(next), raw, &buf); err != nil {
+					return 0, "", err
+				}
+				next++
+				continue
+			}
 		}
 
-		// Nothing to send: caught up, or waiting for the source's first ledger.
+		// Nothing to send: caught up mid-flow, or waiting for the source's
+		// first ledger.
 		if ended {
-			// A bounded subscriber still waiting on ledgers is being cut short,
-			// not served. Saying so on the wire keeps the close honest; the
-			// client does not depend on it, because it compares what arrived
-			// against what it asked for.
-			if req.bounded && next <= uint64(req.end) {
-				return websocket.StatusGoingAway, "source ended before range complete", nil
+			if srcErr := s.b.failure(); srcErr != nil {
+				// Never let a source failure look like a clean end: an
+				// unbounded consumer would see err == nil and stop ingesting
+				// with nothing to log or retry on.
+				return websocket.StatusInternalError, "source failed", nil
 			}
-			return websocket.StatusNormalClosure, "source ended", nil
+			code, reason := endedClose(req, next)
+			return code, reason, nil
 		}
 		select {
 		case <-changed:
@@ -359,26 +631,82 @@ func (s *Server) serve(
 	}
 }
 
+// writeStamplessFlow delivers the retained, completed current flow to a
+// subscriber that reached it only after it finished. The shared in-memory
+// chunk messages go out as they are (chunks carry no stamps), but BEGIN and
+// END are re-framed with both emit stamps zero, so the delivery contributes
+// no latency sample.
+func (s *Server) writeStamplessFlow(
+	ctx context.Context, conn *websocket.Conn, snap flowSnap, buf *[]byte,
+) error {
+	end, err := wire.Decode(snap.end)
+	if err != nil {
+		return fmt.Errorf("re-frame end of ledger %d: %w", snap.seq(), err)
+	}
+	b := *buf
+	defer func() { *buf = b }()
+
+	b = wire.AppendBegin(b[:0], snap.seq(), 0)
+	if err := s.write(ctx, conn, b); err != nil {
+		return err
+	}
+	for _, chunk := range snap.chunks {
+		if err := s.write(ctx, conn, chunk); err != nil {
+			return err
+		}
+	}
+	b = wire.AppendEnd(b[:0], snap.seq(), end.ChunkCount, end.TotalLen, 0, end.Checksum)
+	return s.write(ctx, conn, b)
+}
+
+// writeRingFlow delivers one complete ledger from the retention ring as a
+// chunk flow with both emit stamps zero: the original emission times are not
+// persisted, and a replayed ledger must never contribute a delivery sample.
+func (s *Server) writeRingFlow(
+	ctx context.Context, conn *websocket.Conn, seq uint32, raw []byte, buf *[]byte,
+) error {
+	b := *buf
+	defer func() { *buf = b }()
+
+	b = wire.AppendBegin(b[:0], seq, 0)
+	if err := s.write(ctx, conn, b); err != nil {
+		return err
+	}
+	var idx uint32
+	for off := 0; off < len(raw); off += s.chunkSize {
+		chunk := raw[off:min(off+s.chunkSize, len(raw))]
+		b = wire.AppendChunk(b[:0], seq, idx, chunk)
+		if err := s.write(ctx, conn, b); err != nil {
+			return err
+		}
+		idx++
+	}
+	b = wire.AppendEnd(b[:0], seq, idx, uint64(len(raw)), 0, xxhash.Sum64(raw))
+	return s.write(ctx, conn, b)
+}
+
 func (s *Server) write(ctx context.Context, conn *websocket.Conn, msg []byte) error {
-	wctx, cancel := context.WithTimeout(ctx, writeTimeout)
+	wctx, cancel := context.WithTimeout(ctx, chunkWriteTimeout)
 	defer cancel()
 	return conn.Write(wctx, websocket.MessageBinary, msg)
 }
 
 // health is the /healthz body.
 type health struct {
-	Oldest      uint32 `json:"oldest"`
-	Latest      uint32 `json:"latest"`
-	Subscribers int    `json:"subscribers"`
+	Oldest       uint32 `json:"oldest"`
+	Latest       uint32 `json:"latest"`
+	Subscribers  int    `json:"subscribers"`
+	LiveAbandons uint64 `json:"live_abandons"`
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	oldest, latest, _ := s.store.Bounds()
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(health{
-		Oldest:      oldest,
-		Latest:      latest,
-		Subscribers: s.Subscribers(),
+		Oldest:       oldest,
+		Latest:       latest,
+		Subscribers:  s.Subscribers(),
+		LiveAbandons: s.LiveAbandons(),
 	}); err != nil {
 		s.log.Debug("healthz write failed", "error", err)
 	}

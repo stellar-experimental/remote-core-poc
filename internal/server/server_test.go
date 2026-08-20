@@ -20,17 +20,29 @@ import (
 	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
 
 	"github.com/stellar-experimental/remote-core-poc/internal/store"
+	"github.com/stellar-experimental/remote-core-poc/internal/wire"
 	"github.com/stellar-experimental/remote-core-poc/remoteledger"
 )
 
-// consumer collects sequences, emit stamps, payload copies and any error from
-// one subscription. It is the assertion surface of the end-to-end tests: what a
-// real consumer of the seam sees.
+// consumer collects sequences, delivery metadata, payload copies and any error
+// from one subscription. It is the assertion surface of the end-to-end tests:
+// what a real consumer of the seam sees.
 type consumer struct {
 	seqs     []uint32
-	stamps   []int64 // zero means the ledger was served from the retention ring
+	stamps   []int64 // emit-end stamps; zero means the ledger was served from the retention ring
+	infos    []remoteledger.LedgerInfo
 	payloads [][]byte
 	err      error
+}
+
+// discarded is the total partial assemblies thrown away across the run: the
+// client-side count of the server's live-flow abandons.
+func (c *consumer) discarded() int {
+	n := 0
+	for _, info := range c.infos {
+		n += info.DiscardedPartials
+	}
+	return n
 }
 
 // consume subscribes to h over rng and reads until the stream ends, limit
@@ -39,27 +51,28 @@ type consumer struct {
 // into a test failure instead of a package timeout.
 func consume(
 	ctx context.Context, t *testing.T, url string, rng ledgerbackend.Range, limit int, onLedger func(seq uint32),
+	opts ...remoteledger.Option,
 ) *consumer {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	c := &consumer{}
-	var seq uint32
-	var stamp int64
-	stream := remoteledger.New(url, remoteledger.WithObserver(func(info remoteledger.LedgerInfo) {
-		seq = info.Sequence
-		stamp = info.EmitUnixNano
+	var last remoteledger.LedgerInfo
+	opts = append(opts, remoteledger.WithObserver(func(info remoteledger.LedgerInfo) {
+		last = info
 	}))
+	stream := remoteledger.New(url, opts...)
 	for raw, err := range stream.RawLedgers(ctx, rng) {
 		if err != nil {
 			c.err = err
 			return c
 		}
-		c.seqs = append(c.seqs, seq)
-		c.stamps = append(c.stamps, stamp)
+		c.seqs = append(c.seqs, last.Sequence)
+		c.stamps = append(c.stamps, last.EmitEndUnixNano)
+		c.infos = append(c.infos, last)
 		c.payloads = append(c.payloads, bytes.Clone(raw))
 		if onLedger != nil {
-			onLedger(seq)
+			onLedger(last.Sequence)
 		}
 		if limit > 0 && len(c.seqs) >= limit {
 			break
@@ -97,7 +110,7 @@ func wantContiguous(t *testing.T, seqs []uint32, from, to uint32) {
 }
 
 func TestNewValidation(t *testing.T) {
-	src := NewSyntheticStream(SyntheticConfig{})
+	src := PacedSource(NewSyntheticStream(SyntheticConfig{}), 0, 0)
 	tests := []struct {
 		name string
 		cfg  Config
@@ -121,6 +134,15 @@ func TestNewValidation(t *testing.T) {
 	}
 	if _, err := New(Config{Source: src, Range: ledgerbackend.UnboundedRange(0), Store: ring}); err == nil {
 		t.Error("New with a zero start ledger succeeded, want an error")
+	}
+
+	// The chunk-size bounds are an interop contract with every client's read
+	// limit, so they bind library embedders, not just the CLI flag parsers.
+	for _, bad := range []int{1024, wire.MaxChunkSize + 1} {
+		cfg := Config{Source: src, Range: ledgerbackend.UnboundedRange(1), Store: ring, ChunkSize: bad}
+		if _, err := New(cfg); err == nil {
+			t.Errorf("New accepted chunk size %d, outside the protocol bounds", bad)
+		}
 	}
 }
 
@@ -270,7 +292,7 @@ func TestSourceLoopRejectsAnOversizedLedger(t *testing.T) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	srv, err := New(Config{
-		Source: NewSyntheticStream(SyntheticConfig{Size: 4096}),
+		Source: PacedSource(NewSyntheticStream(SyntheticConfig{Size: 4096}), 0, 0),
 		Range:  ledgerbackend.BoundedRange(1, 3),
 		Store:  ring,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -446,10 +468,12 @@ func TestStalledSubscriberFallingOutOfRetentionIsTooFarBehind(t *testing.T) {
 }
 
 func TestManySubscribersShareTheStream(t *testing.T) {
-	// Every subscriber's write hands out the same tip.msg backing array, and
-	// the race detector only sees that sharing when many goroutines do it at
-	// once. Payload equality is the corruption check.
-	h := startHarness(t, harnessOpts{count: 50, size: 4 << 10, interval: time.Millisecond})
+	// Every subscriber shares the flow's chunk messages, and the race detector
+	// only sees that sharing when many goroutines do it at once. Payload
+	// equality is the corruption check. The emit window keeps flows open long
+	// enough that subscribers reliably join some of them mid-emission — the
+	// stamped live path — as well as after completion (the stampless path).
+	h := startHarness(t, harnessOpts{count: 50, size: 4 << 10, interval: time.Millisecond, emitWindow: 2 * time.Millisecond})
 
 	const subscribers = 8
 	results := make(chan *consumer, subscribers)
@@ -505,6 +529,34 @@ func TestLargeLedgerRoundTrips(t *testing.T) {
 	}
 }
 
+func TestCompletedFlowServedToLateArrivalIsStampless(t *testing.T) {
+	// The current flow is retained in memory after it completes. A subscriber
+	// that reaches it only then — the README's own "bound the range just
+	// ahead of latest" methodology produces exactly this — was not following
+	// live, so handing it the flow's original stamps would record the flow's
+	// age (up to a whole cadence) as a delivery latency. It must arrive
+	// stampless, like any other redelivery of history.
+	h := startHarness(t, harnessOpts{count: 5})
+	if err := h.wait(t); err != nil {
+		t.Fatalf("source loop: %v", err)
+	}
+
+	c := consume(t.Context(), t, h.url, ledgerbackend.BoundedRange(5, 5), 0, nil)
+	if c.err != nil {
+		t.Fatalf("stream error: %v", c.err)
+	}
+	wantContiguous(t, c.seqs, 5, 5)
+	if !bytes.Equal(c.payloads[0], h.payload(5)) {
+		t.Error("the stampless redelivery does not match what the source produced")
+	}
+	if c.stamps[0] != 0 {
+		t.Errorf("ledger 5 arrived with emit stamp %d; a post-completion arrival must be stampless", c.stamps[0])
+	}
+	if _, ok := c.infos[0].Delivery(); ok {
+		t.Error("a post-completion arrival contributed a delivery sample")
+	}
+}
+
 func TestHealthz(t *testing.T) {
 	h := startHarness(t, harnessOpts{count: 5})
 	if err := h.wait(t); err != nil {
@@ -543,13 +595,101 @@ func TestStreamRejectsBadQuery(t *testing.T) {
 		// not streamable from either parameter.
 		"?start=4294967295", "?end=4294967295", "?start=4294967295&end=4294967295",
 	} {
-		resp, err := http.Get(h.url + "/v1/stream" + query)
+		resp, err := http.Get(h.url + "/stream" + query)
 		if err != nil {
 			t.Fatalf("GET %s: %v", query, err)
 		}
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("GET %s status = %d, want 400", query, resp.StatusCode)
+		}
+	}
+}
+
+func TestLiveDeliveryCarriesFlowStamps(t *testing.T) {
+	// The whole point of chunking: a live ledger arrives as many chunks with both
+	// emit stamps, and T_emit spans most of the emission window — proof the
+	// transfer overlapped emission instead of following it.
+	const (
+		size       = 64 << 10
+		chunkSize  = 4 << 10
+		emitWindow = 30 * time.Millisecond
+	)
+	h := startHarness(t, harnessOpts{
+		size: size, chunkSize: chunkSize, emitWindow: emitWindow, interval: time.Millisecond,
+	})
+
+	c := consume(t.Context(), t, h.url, ledgerbackend.UnboundedRange(0), 3, nil)
+	if c.err != nil {
+		t.Fatalf("stream error: %v", c.err)
+	}
+	if len(c.infos) != 3 {
+		t.Fatalf("received %d ledgers, want 3", len(c.infos))
+	}
+	for _, info := range c.infos {
+		if !bytes.Equal(c.payloads[slices.Index(c.seqs, info.Sequence)], h.payload(info.Sequence)) {
+			t.Errorf("ledger %d payload does not match what the source produced", info.Sequence)
+		}
+		if want := size / chunkSize; info.Chunks != want {
+			t.Errorf("ledger %d arrived in %d chunks, want %d", info.Sequence, info.Chunks, want)
+		}
+		if _, ok := info.Delivery(); !ok {
+			t.Errorf("ledger %d carries no delivery measurement; it was received live", info.Sequence)
+		}
+		emit, ok := info.EmitWindow()
+		if !ok {
+			t.Errorf("ledger %d carries no emit window", info.Sequence)
+			continue
+		}
+		if emit < emitWindow/2 || emit > 10*emitWindow {
+			t.Errorf("ledger %d T_emit = %s, want roughly the %s window", info.Sequence, emit, emitWindow)
+		}
+		if pipeline, ok := info.Pipeline(); !ok || pipeline < emit {
+			t.Errorf("ledger %d pipeline = (%s, %v), want at least T_emit %s", info.Sequence, pipeline, ok, emit)
+		}
+	}
+}
+
+func TestSlowSubscriberIsAbandonedMidLedgerAndRecoversFromTheRing(t *testing.T) {
+	// Ledgers far bigger than any socket buffering, emitted over a window: the
+	// stalled subscriber's server-side writes block mid-ledger, the source
+	// runs ahead regardless, and on resume the flow has moved past the ledger
+	// the subscriber was inside — so its live flow is abandoned and the ledger
+	// is redelivered complete from the ring. The client must discard the
+	// partial and end up with every ledger intact.
+	const count = 5
+	h := startHarness(t, harnessOpts{
+		count: count, size: 8 << 20, interval: time.Millisecond, emitWindow: 50 * time.Millisecond,
+		retention: 100,
+	})
+
+	c := consume(t.Context(), t, h.url, ledgerbackend.UnboundedRange(1), 0, func(seq uint32) {
+		if seq == 1 {
+			// Stall until the source has produced everything: the ledger the
+			// server is currently writing to us is by then far behind the flow.
+			if err := h.wait(t); err != nil {
+				t.Errorf("source loop: %v", err)
+			}
+		}
+	})
+	if c.err != nil {
+		t.Fatalf("stream error: %v", c.err)
+	}
+	wantContiguous(t, c.seqs, 1, count)
+	for i, seq := range c.seqs {
+		if !bytes.Equal(c.payloads[i], h.payload(seq)) {
+			t.Errorf("ledger %d payload does not match what the source produced", seq)
+		}
+	}
+	if c.discarded() == 0 {
+		t.Error("no partial assembly was discarded: the abandon path was never exercised")
+	}
+	if h.srv.LiveAbandons() == 0 {
+		t.Error("the server counted no live-flow abandons")
+	}
+	for i, info := range c.infos {
+		if info.DiscardedPartials > 0 && c.stamps[i] != 0 {
+			t.Errorf("ledger %d replaced a partial but carries an emit stamp; a ring redelivery must not", info.Sequence)
 		}
 	}
 }

@@ -23,15 +23,19 @@ func TestParseFlagsDefaults(t *testing.T) {
 
 func TestParseFlagsRejects(t *testing.T) {
 	tests := map[string][]string{
-		"unknown mode":           {"--mode", "carrier-pigeon"},
-		"end before start":       {"--mode", "remote", "--start", "9", "--end", "4"},
-		"zero count in loopback": {"--mode", "loopback", "--count", "0"},
-		"local without start":    {"--mode", "local", "--core-config", "x", "--history-archive-urls", "y"},
-		"local without config":   {"--mode", "local", "--start", "5", "--history-archive-urls", "y"},
-		"local without archives": {"--mode", "local", "--start", "5", "--core-config", "x"},
-		"sequence out of range":  {"--mode", "remote", "--start", "4294967296"},
-		"stray argument":         {"--mode", "remote", "extra"},
-		"unknown flag":           {"--turbo"},
+		"unknown mode":            {"--mode", "carrier-pigeon"},
+		"end before start":        {"--mode", "remote", "--start", "9", "--end", "4"},
+		"zero count in loopback":  {"--mode", "loopback", "--count", "0"},
+		"local without start":     {"--mode", "local", "--core-config", "x", "--history-archive-urls", "y"},
+		"local without config":    {"--mode", "local", "--start", "5", "--history-archive-urls", "y"},
+		"local without archives":  {"--mode", "local", "--start", "5", "--core-config", "x"},
+		"sequence out of range":   {"--mode", "remote", "--start", "4294967296"},
+		"stray argument":          {"--mode", "remote", "extra"},
+		"unknown flag":            {"--turbo"},
+		"chunk size too small":    {"--chunk-size", "1024"},
+		"chunk size too large":    {"--chunk-size", "16777216"},
+		"negative emit window":    {"--emit-window", "-1ms"},
+		"window outruns interval": {"--emit-window", "20ms", "--synthetic-interval", "10ms"},
 	}
 	for name, args := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -42,12 +46,26 @@ func TestParseFlagsRejects(t *testing.T) {
 	}
 }
 
+func TestParseFlagsPacingDefaults(t *testing.T) {
+	o, err := parseFlags(io.Discard, nil)
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if o.emitWindow != 5*time.Millisecond {
+		t.Errorf("default emit window = %s, want 5ms (inside the 10ms interval)", o.emitWindow)
+	}
+	if o.emitWindow > o.syntheticInterval {
+		t.Errorf("default emit window %s does not fit inside the default interval %s", o.emitWindow, o.syntheticInterval)
+	}
+}
+
 func TestRunLoopback(t *testing.T) {
-	// The whole path in one process: synthetic source, server, WebSocket, client.
-	// --verify makes it an integrity check too.
+	// The whole path in one process: synthetic source, server, WebSocket,
+	// chunked client. --verify makes it an integrity check too, which is what
+	// pins reassembly: a chunk lost or reordered would change the bytes.
 	o, err := parseFlags(io.Discard, []string{
-		"--mode", "loopback", "--count", "8", "--synthetic-size", "4096",
-		"--synthetic-interval", "1ms", "--verify",
+		"--mode", "loopback", "--count", "8", "--synthetic-size", "65536",
+		"--synthetic-interval", "10ms", "--emit-window", "5ms", "--verify",
 	})
 	if err != nil {
 		t.Fatalf("parseFlags: %v", err)
@@ -64,18 +82,24 @@ func TestRunLoopback(t *testing.T) {
 		if s.seq != uint32(i+1) {
 			t.Fatalf("ledger sequences are not 1..8: %+v", c.samples)
 		}
-		if s.bytes != 4096 {
-			t.Errorf("ledger %d arrived with %d bytes, want 4096", s.seq, s.bytes)
+		if s.bytes != 65536 {
+			t.Errorf("ledger %d arrived with %d bytes, want 65536", s.seq, s.bytes)
 		}
 	}
 	// The consumer subscribes before the source starts, so every ledger is
 	// delivered live and none drops out of the latency measurement.
 	if got, want := len(c.deliveries()), len(c.samples); got != want {
-		t.Errorf("%d of %d ledgers carried an emit stamp; loopback must deliver them all live", got, want)
+		t.Errorf("%d of %d ledgers carried emit stamps; loopback must deliver them all live", got, want)
+	}
+	if got, want := len(c.emits()), len(c.samples); got != want {
+		t.Errorf("%d of %d ledgers carried a T_emit measurement", got, want)
+	}
+	if c.fallbacks() != 0 {
+		t.Errorf("%d ring fallbacks on an unstalled loopback run, want 0", c.fallbacks())
 	}
 
 	summary := c.summary()
-	for _, want := range []string{"ledgers      8 (1..8)", "throughput", "delivery"} {
+	for _, want := range []string{"ledgers      8 (1..8)", "throughput", "t_emit", "delivery", "pipeline", "fallbacks"} {
 		if !strings.Contains(summary, want) {
 			t.Errorf("summary is missing %q:\n%s", want, summary)
 		}
@@ -84,7 +108,7 @@ func TestRunLoopback(t *testing.T) {
 
 func TestWriteCSVFile(t *testing.T) {
 	c := newCollector("file")
-	c.add(1, 10, time.Now(), time.Millisecond, true)
+	c.add(time.Now(), sample{seq: 1, bytes: 10, delivery: time.Millisecond, hasDelivery: true})
 	path := t.TempDir() + "/out.csv"
 	if err := writeCSVFile(path, c); err != nil {
 		t.Fatalf("writeCSVFile: %v", err)

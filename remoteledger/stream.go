@@ -5,6 +5,10 @@
 // captive-core stream for a Stream pointed at a corestreamd URL and the ingest
 // hot loop is unchanged, with core running on another machine. See
 // docs/rpc-wiring.md.
+//
+// The client reassembles each ledger from the server's chunk flow and
+// verifies its xxhash64 before yielding it, so the seam above stays
+// byte-identical to captive core's.
 package remoteledger
 
 import (
@@ -19,6 +23,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/coder/websocket"
 	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
 
@@ -42,6 +47,12 @@ var (
 	// orderly: the server's source ended, or something between the two ends
 	// closed the connection politely.
 	ErrTruncated = errors.New("remoteledger: stream ended before the requested range was delivered")
+
+	// ErrProtocol means the server broke the message grammar: a chunk out of
+	// order or outside a flow, an END whose counts disagree with what arrived,
+	// or a checksum mismatch. Violations end the stream — a ledger that cannot
+	// be verified must never be handed up as if it had been.
+	ErrProtocol = errors.New("remoteledger: protocol violation")
 )
 
 // TooFarBehindError carries the retained range the server reported when it
@@ -68,57 +79,105 @@ func (e *TooFarBehindError) Unwrap() error { return ErrTooFarBehind }
 // connection down, so a Stream is reusable and safe to keep in a config.
 type Stream struct {
 	rawURL string
-	// maxPayloadSize caps the ledger bytes accepted; the read limit adds the
-	// protocol header on top. Negative means no cap.
+	// maxPayloadSize caps the assembled ledger bytes accepted. Negative means
+	// no cap.
 	maxPayloadSize int64
-	httpClient     *http.Client
-	dialTimeout    time.Duration
-	observe        func(LedgerInfo)
+	// maxChunkSize caps a single chunk's payload; the read limit adds the
+	// chunk header on top.
+	maxChunkSize int64
+	httpClient   *http.Client
+	dialTimeout  time.Duration
+	observe      func(LedgerInfo)
 }
 
-// readLimit is the whole-message ceiling for the configured payload cap.
+// readLimit is the whole-message ceiling: one chunk plus its header (an END,
+// at wire.EndSize bytes, always fits under it). A negative cap disables the
+// limit; zero means the default. Saturate rather than wrap: an enormous chunk
+// cap plus the header would overflow to a negative limit, which is how the
+// library spells "no limit at all" — the one thing a huge cap must not
+// silently become.
 func (s *Stream) readLimit() int64 {
-	if s.maxPayloadSize < 0 {
+	n := s.maxChunkSize
+	if n < 0 {
 		return -1 // coder/websocket's "unlimited"
 	}
-	// Saturate rather than wrap: a cap near math.MaxInt64 plus the header would
-	// overflow to a negative limit, which is how the library spells "no limit at
-	// all" — turning an enormous cap into no cap.
-	if s.maxPayloadSize > math.MaxInt64-wire.HeaderSize {
-		return math.MaxInt64
+	if n == 0 {
+		n = wire.MaxChunkSize
 	}
-	return s.maxPayloadSize + wire.HeaderSize
+	if n > math.MaxInt64-wire.ChunkHeaderSize-1 {
+		// Saturate BELOW MaxInt64: coder/websocket increments whatever it is
+		// given, so MaxInt64 wraps negative and it treats that as unlimited —
+		// the exact outcome this cap exists to prevent.
+		return math.MaxInt64 - 1
+	}
+	return max(n+wire.ChunkHeaderSize, wire.EndSize)
 }
 
 // LedgerInfo is the delivery metadata of one received ledger. It exists because
 // the LedgerStream seam carries payloads only: the benchmark harness needs the
-// server's emit stamp, and a consumer measuring its own transport is the only
-// party that can pair it with a receive stamp.
+// server's emit stamps, and a consumer measuring its own transport is the only
+// party that can pair them with a receive stamp.
 type LedgerInfo struct {
-	// Sequence is the ledger this message carried.
+	// Sequence is the ledger this flow carried.
 	Sequence uint32
 
-	// EmitUnixNano is the server's wall clock when the ledger arrived from its
-	// source. It is zero for a ledger replayed from the server's retention: the
-	// arrival time is not persisted, so no delivery latency can be derived.
-	EmitUnixNano int64
+	// EmitStartUnixNano is the server's wall clock at the FIRST byte of the
+	// ledger from its source. It is zero for a ledger replayed from the
+	// server's retention.
+	EmitStartUnixNano int64
 
-	// ReceivedUnixNano is this client's wall clock when the message finished
-	// arriving. Comparing it with EmitUnixNano assumes the two clocks agree —
-	// true on one host, close enough under NTP across hosts.
+	// EmitEndUnixNano is the server's wall clock at the LAST byte of the ledger
+	// from its source. It is zero for a ledger replayed from retention: the
+	// emission times are not persisted, so no delivery latency can be derived.
+	EmitEndUnixNano int64
+
+	// ReceivedUnixNano is this client's wall clock once the ledger is usable:
+	// assembly complete, checksum verified. Comparing it with the emit stamps
+	// assumes the two clocks agree — true on one host, close under NTP across
+	// hosts.
 	ReceivedUnixNano int64
 
-	// Size is the ledger payload's byte count, excluding the protocol header.
+	// Size is the ledger's byte count, excluding all protocol framing.
 	Size int
+
+	// Chunks is how many CHUNK messages carried the ledger.
+	Chunks int
+
+	// DiscardedPartials counts partial assemblies of this same sequence thrown
+	// away before this complete delivery: each one is a live chunk flow the
+	// server abandoned mid-ledger and then redelivered from its retention ring.
+	// A measurement window must show zero of these.
+	DiscardedPartials int
 }
 
-// Delivery is ReceivedUnixNano - EmitUnixNano, and ok is false for a replayed
-// ledger, which carries no emit stamp.
+// Delivery is ReceivedUnixNano - EmitEndUnixNano — the headline metric: how
+// long after the source finished emitting the ledger it was usable here. ok is
+// false for a replayed ledger, which carries no stamps.
 func (l LedgerInfo) Delivery() (d time.Duration, ok bool) {
-	if l.EmitUnixNano == 0 {
+	if l.EmitEndUnixNano == 0 {
 		return 0, false
 	}
-	return time.Duration(l.ReceivedUnixNano - l.EmitUnixNano), true
+	return time.Duration(l.ReceivedUnixNano - l.EmitEndUnixNano), true
+}
+
+// Pipeline is ReceivedUnixNano - EmitStartUnixNano: the whole path from the
+// source's first byte. ok is false when there is no emit-start stamp (a
+// replayed ledger).
+func (l LedgerInfo) Pipeline() (d time.Duration, ok bool) {
+	if l.EmitStartUnixNano == 0 {
+		return 0, false
+	}
+	return time.Duration(l.ReceivedUnixNano - l.EmitStartUnixNano), true
+}
+
+// EmitWindow is EmitEndUnixNano - EmitStartUnixNano: T_emit, how long the
+// source took to emit the ledger, measured on the server's clock alone. ok is
+// false when either stamp is missing.
+func (l LedgerInfo) EmitWindow() (d time.Duration, ok bool) {
+	if l.EmitStartUnixNano == 0 || l.EmitEndUnixNano == 0 {
+		return 0, false
+	}
+	return time.Duration(l.EmitEndUnixNano - l.EmitStartUnixNano), true
 }
 
 var _ ledgerbackend.LedgerStream = (*Stream)(nil)
@@ -135,12 +194,25 @@ func WithHTTPClient(client *http.Client) Option {
 	return func(s *Stream) { s.httpClient = client }
 }
 
-// WithMaxMessageSize caps the ledger PAYLOAD the client will accept, in bytes;
-// the protocol header is admitted on top of it, so a limit of n accepts a ledger
-// of exactly n bytes. The default is wire.DefaultMaxPayloadSize, 256 MiB, which
-// matches the SDK's captive-core frame cap. Negative disables the cap.
+// WithMaxMessageSize caps the ledger the client will accept, in bytes — the
+// whole assembled ledger; a limit of n accepts a ledger of exactly n bytes. The default is wire.DefaultMaxPayloadSize,
+// 256 MiB, which matches the SDK's captive-core frame cap. Negative disables
+// the cap.
 func WithMaxMessageSize(n int64) Option {
 	return func(s *Stream) { s.maxPayloadSize = n }
+}
+
+// WithMaxChunkSize caps a single chunk's payload, in bytes; the WebSocket
+// read limit is this plus the chunk header, which is what keeps the
+// connection's admission at chunk size rather than whole-ledger size. Zero
+// means the default — wire.MaxChunkSize, the largest chunk a server flag can
+// configure, so defaults on both ends always interoperate — and negative
+// disables the per-message limit entirely, mirroring WithMaxMessageSize (the
+// assembled-ledger cap still applies). A positive cap must be at least the
+// server's --chunk-size or every ledger's first chunk is rejected as
+// oversized.
+func WithMaxChunkSize(n int64) Option {
+	return func(s *Stream) { s.maxChunkSize = n }
 }
 
 // WithDialTimeout bounds the handshake. Zero or negative means no timeout beyond
@@ -178,8 +250,8 @@ func New(rawURL string, opts ...Option) *Stream {
 //
 // The connection is dialled on the first pull and closed when iteration ends —
 // completion, break, error, or ctx cancellation. Each yielded slice is BORROWED:
-// it is the read buffer and the next iteration step overwrites it, so a consumer
-// that retains a ledger must copy it.
+// it is the assembly buffer and the next iteration step overwrites it, so a
+// consumer that retains a ledger must copy it.
 //
 // A bounded range that ends early yields ErrTruncated rather than ending
 // quietly: the contract is every ledger in the range, so an orderly close short
@@ -204,7 +276,12 @@ func (s *Stream) RawLedgers(
 			dialCtx, cancel = context.WithTimeout(ctx, s.dialTimeout)
 			defer cancel()
 		}
-		conn, _, err := websocket.Dial(dialCtx, endpoint, &websocket.DialOptions{HTTPClient: s.httpClient})
+		conn, _, err := websocket.Dial(dialCtx, endpoint, &websocket.DialOptions{
+			HTTPClient: s.httpClient,
+			// Explicitly no permessage-deflate: the codec's milliseconds are the
+			// kind of tail this transport exists to avoid.
+			CompressionMode: websocket.CompressionDisabled,
+		})
 		if err != nil {
 			yield(nil, fmt.Errorf("remoteledger: dial %s: %w", endpoint, err))
 			return
@@ -214,82 +291,205 @@ func (s *Stream) RawLedgers(
 		defer func() { _ = conn.CloseNow() }()
 		conn.SetReadLimit(s.readLimit())
 
-		// One buffer, reused: this is what makes the yielded slice a borrow.
-		var buf bytes.Buffer
-		expected := ledgerRange.From()
-		// Set once the last representable sequence has been delivered. Nothing can
-		// follow it: expected wraps to 0 there, which is the value that means
-		// "accept any first ledger", so without this flag a wrap would silently
-		// re-open the stream to any sequence at all.
-		var exhausted bool
+		s.stream(ctx, conn, ledgerRange, yield)
+	}
+}
 
-		for {
-			typ, reader, err := conn.Reader(ctx)
-			if err != nil {
-				if done, cerr := classifyClose(err, expected); done {
-					if cerr == nil {
-						// An orderly close is only the end of the story when the
-						// range was actually delivered.
-						cerr = truncated(ledgerRange, expected)
-					}
-					if cerr != nil {
-						yield(nil, cerr)
-					}
+// seqTracker enforces the in-order, gapless delivery the protocol promises.
+// A tip subscription (expected 0) accepts whatever ledger arrives first and
+// holds the server to continuity from there. The last representable sequence
+// has no successor, so nothing may follow it: expected would wrap to 0 there —
+// the value that means "accept any first ledger" — which is why the wrap is a
+// tracked state rather than an arithmetic accident.
+type seqTracker struct {
+	expected  uint32
+	exhausted bool
+}
+
+// accept checks that seq may arrive now.
+func (t *seqTracker) accept(seq uint32) error {
+	if t.exhausted {
+		return fmt.Errorf("%w: ledger %d cannot follow %d, the last representable sequence",
+			ErrGap, seq, uint32(math.MaxUint32))
+	}
+	if t.expected != 0 && seq != t.expected {
+		return fmt.Errorf("%w: got ledger %d, expected %d", ErrGap, seq, t.expected)
+	}
+	return nil
+}
+
+// advance records seq as delivered.
+func (t *seqTracker) advance(seq uint32) {
+	t.exhausted = seq == math.MaxUint32
+	t.expected = seq + 1
+}
+
+// deliver yields one complete ledger and reports whether iteration should
+// continue, closing the connection when the consumer stops pulling or the
+// bounded range is complete.
+func deliver(
+	conn *websocket.Conn, ledgerRange ledgerbackend.Range, seq uint32, payload []byte,
+	yield func([]byte, error) bool,
+) bool {
+	if !yield(payload, nil) {
+		_ = conn.Close(websocket.StatusNormalClosure, "consumer done")
+		return false
+	}
+	if ledgerRange.Bounded() && seq >= ledgerRange.To() {
+		_ = conn.Close(websocket.StatusNormalClosure, "range complete")
+		return false
+	}
+	return true
+}
+
+// readMessage pulls one binary message into buf, replacing its contents.
+func readMessage(ctx context.Context, conn *websocket.Conn, buf *bytes.Buffer) error {
+	typ, reader, err := conn.Reader(ctx)
+	if err != nil {
+		return err
+	}
+	if typ != websocket.MessageBinary {
+		return fmt.Errorf("%w: unexpected %v message", ErrProtocol, typ)
+	}
+	buf.Reset()
+	if _, err := buf.ReadFrom(reader); err != nil {
+		return fmt.Errorf("remoteledger: read message body: %w", err)
+	}
+	return nil
+}
+
+// stream is the read loop: reassemble BEGIN/CHUNK*/END into the complete raw
+// ledger, verify it, and yield it. The seam above cannot tell the difference —
+// only the observer sees the flow's timing.
+func (s *Stream) stream(
+	ctx context.Context, conn *websocket.Conn, ledgerRange ledgerbackend.Range, yield func([]byte, error) bool,
+) {
+	var msgBuf bytes.Buffer
+	// asm is the assembly in progress. Its buffer is reused across ledgers,
+	// which is what makes the yielded slice a borrow.
+	asm := struct {
+		active    bool
+		seq       uint32
+		emitStart int64
+		buf       []byte
+		chunks    uint32
+		discarded int
+	}{}
+	hasher := xxhash.New()
+	track := seqTracker{expected: ledgerRange.From()}
+
+	for {
+		if err := readMessage(ctx, conn, &msgBuf); err != nil {
+			done, cerr := classifyClose(err, track.expected)
+			switch {
+			case !done:
+				yield(nil, fmt.Errorf("remoteledger: read: %w", err))
+			case cerr != nil:
+				yield(nil, cerr)
+			case asm.active:
+				// An orderly close in the middle of an announced ledger is a
+				// truncation even on an unbounded range: BEGIN promised a
+				// ledger the close did not deliver, and treating it as a clean
+				// end would make a server crash mid-emission indistinguishable
+				// from shutdown.
+				yield(nil, fmt.Errorf("%w: stream closed mid-assembly of ledger %d", ErrTruncated, asm.seq))
+			default:
+				// An orderly close is only the end of the story when the range
+				// was actually delivered.
+				if terr := truncated(ledgerRange, track.expected); terr != nil {
+					yield(nil, terr)
+				}
+			}
+			return
+		}
+		m, err := wire.Decode(msgBuf.Bytes())
+		if err != nil {
+			yield(nil, fmt.Errorf("%w: %w", ErrProtocol, err))
+			return
+		}
+
+		switch m.Type {
+		case wire.TypeBegin:
+			if asm.active {
+				if m.Seq != asm.seq {
+					yield(nil, fmt.Errorf("%w: BEGIN for ledger %d while assembling %d", ErrProtocol, m.Seq, asm.seq))
 					return
 				}
-				yield(nil, fmt.Errorf("remoteledger: read: %w", err))
+				// A ring redelivery of the ledger being assembled: the server
+				// abandoned this subscriber's live flow mid-ledger. The partial
+				// is worthless — start over from the replacement.
+				asm.discarded++
+			} else if err := track.accept(m.Seq); err != nil {
+				yield(nil, err)
 				return
 			}
-			if typ != websocket.MessageBinary {
-				yield(nil, fmt.Errorf("remoteledger: unexpected %v message", typ))
-				return
-			}
+			asm.active, asm.seq, asm.emitStart = true, m.Seq, m.EmitStartUnixNano
+			asm.buf, asm.chunks = asm.buf[:0], 0
+			hasher.Reset()
 
-			buf.Reset()
-			if _, err := buf.ReadFrom(reader); err != nil {
-				yield(nil, fmt.Errorf("remoteledger: read message body: %w", err))
+		case wire.TypeChunk:
+			if !asm.active || m.Seq != asm.seq {
+				yield(nil, fmt.Errorf("%w: CHUNK for ledger %d outside its flow", ErrProtocol, m.Seq))
 				return
 			}
+			if m.ChunkIndex != asm.chunks {
+				yield(nil, fmt.Errorf("%w: ledger %d chunk %d arrived, expected chunk %d",
+					ErrProtocol, m.Seq, m.ChunkIndex, asm.chunks))
+				return
+			}
+			if s.maxPayloadSize >= 0 && int64(len(asm.buf))+int64(len(m.Payload)) > s.maxPayloadSize {
+				yield(nil, fmt.Errorf("%w: ledger %d exceeds the %d-byte payload cap",
+					ErrProtocol, m.Seq, s.maxPayloadSize))
+				return
+			}
+			_, _ = hasher.Write(m.Payload) // xxhash's Write cannot fail
+			asm.buf = append(asm.buf, m.Payload...)
+			asm.chunks++
+
+		case wire.TypeEnd:
+			if !asm.active || m.Seq != asm.seq {
+				yield(nil, fmt.Errorf("%w: END for ledger %d outside its flow", ErrProtocol, m.Seq))
+				return
+			}
+			if m.ChunkCount != asm.chunks {
+				yield(nil, fmt.Errorf("%w: ledger %d END declares %d chunks, %d arrived",
+					ErrProtocol, m.Seq, m.ChunkCount, asm.chunks))
+				return
+			}
+			if m.TotalLen != uint64(len(asm.buf)) {
+				yield(nil, fmt.Errorf("%w: ledger %d END declares %d bytes, %d assembled",
+					ErrProtocol, m.Seq, m.TotalLen, len(asm.buf)))
+				return
+			}
+			if sum := hasher.Sum64(); sum != m.Checksum {
+				yield(nil, fmt.Errorf("%w: ledger %d checksum mismatch: got %#016x, want %#016x",
+					ErrProtocol, m.Seq, sum, m.Checksum))
+				return
+			}
+			// The receive stamp is taken only now: the metric is when the
+			// ledger became usable — assembled and verified — not when its last
+			// frame hit the socket.
 			var received int64
 			if s.observe != nil {
 				received = time.Now().UnixNano()
 			}
-			header, payload, err := wire.Decode(buf.Bytes())
-			if err != nil {
-				yield(nil, fmt.Errorf("remoteledger: %w", err))
-				return
-			}
 
-			// The server promises in-order, gapless delivery within a
-			// subscription. A tip subscription (from 0) accepts whatever ledger
-			// arrives first and holds the server to continuity from there.
-			if exhausted {
-				yield(nil, fmt.Errorf("%w: ledger %d cannot follow %d, the last representable sequence",
-					ErrGap, header.Sequence, uint32(math.MaxUint32)))
-				return
-			}
-			if expected != 0 && header.Sequence != expected {
-				yield(nil, fmt.Errorf("%w: got ledger %d, expected %d", ErrGap, header.Sequence, expected))
-				return
-			}
-			exhausted = header.Sequence == math.MaxUint32
-			expected = header.Sequence + 1
+			track.advance(m.Seq)
 
 			if s.observe != nil {
 				s.observe(LedgerInfo{
-					Sequence:         header.Sequence,
-					EmitUnixNano:     header.EmitUnixNano,
-					ReceivedUnixNano: received,
-					Size:             len(payload),
+					Sequence:          m.Seq,
+					EmitStartUnixNano: asm.emitStart,
+					EmitEndUnixNano:   m.EmitEndUnixNano,
+					ReceivedUnixNano:  received,
+					Size:              len(asm.buf),
+					Chunks:            int(asm.chunks),
+					DiscardedPartials: asm.discarded,
 				})
 			}
+			asm.active, asm.discarded = false, 0
 
-			if !yield(payload, nil) {
-				_ = conn.Close(websocket.StatusNormalClosure, "consumer done")
-				return
-			}
-			if ledgerRange.Bounded() && header.Sequence >= ledgerRange.To() {
-				_ = conn.Close(websocket.StatusNormalClosure, "range complete")
+			if !deliver(conn, ledgerRange, m.Seq, asm.buf, yield) {
 				return
 			}
 		}

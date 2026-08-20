@@ -3,3 +3,8 @@ corestreamd-data/
 
 # Benchmark output.
 *.csv
+
+# Binaries from `go build ./cmd/...` in the repo root — 39MB each; one
+# `git add .` would bake them into history forever.
+/corestreamd
+/benchrunner
