@@ -5,6 +5,7 @@ go 1.26
 require (
 	github.com/cespare/xxhash/v2 v2.2.0
 	github.com/coder/websocket v1.8.15
+	github.com/klauspost/compress v1.19.2
 	github.com/stellar/go-stellar-sdk v0.6.1-0.20260716145807-2bfffb159f36
 )
 
@@ -54,7 +55,6 @@ require (
 	github.com/googleapis/gax-go/v2 v2.12.4 // indirect
 	github.com/hashicorp/golang-lru v1.0.2 // indirect
 	github.com/jmespath/go-jmespath v0.4.0 // indirect
-	github.com/klauspost/compress v1.19.2 // indirect
 	github.com/matttproud/golang_protobuf_extensions/v2 v2.0.0 // indirect
 	github.com/pelletier/go-toml v1.9.5 // indirect
 	github.com/pkg/errors v0.9.1 // indirect

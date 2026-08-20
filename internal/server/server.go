@@ -27,12 +27,12 @@ import (
 	"math"
 	"net/http"
 	"strconv"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/coder/websocket"
+	"github.com/klauspost/compress/zstd"
 	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
 
 	"github.com/stellar-experimental/remote-core-poc/internal/store"
@@ -100,12 +100,12 @@ type Server struct {
 	log       *slog.Logger
 	chunkSize int
 
+	// enc is the one encoder the live pipeline's workers and every ring
+	// replay share; zstd.Encoder is itself a pool of encoder states, so
+	// concurrent EncodeAll calls do not contend. Nil when not compressing.
+	enc             *zstd.Encoder
 	compress        bool
 	compressWorkers int
-	// ringEncPool holds encoders for ledgers replayed from the retention ring. Catch-up
-	// is not latency-critical, so it runs on the serving goroutine with one
-	// encoder per subscriber rather than through the live pipeline.
-	ringEncPool sync.Pool
 
 	published    atomic.Uint64
 	subscribers  atomic.Int64
@@ -141,6 +141,19 @@ func New(cfg Config) (*Server, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	workers, err := validateCompressWorkers(cfg.CompressWorkers)
+	if err != nil {
+		return nil, fmt.Errorf("server: %w", err)
+	}
+	var enc *zstd.Encoder
+	if cfg.Compress {
+		// Built here rather than in Run so a bad configuration fails before
+		// the listener binds, not after the daemon reports itself up.
+		enc, err = newEncoder(workers)
+		if err != nil {
+			return nil, fmt.Errorf("server: compression: %w", err)
+		}
+	}
 	return &Server{
 		source:    cfg.Source,
 		rng:       cfg.Range,
@@ -149,8 +162,9 @@ func New(cfg Config) (*Server, error) {
 		log:       logger,
 		chunkSize: chunkSize,
 
+		enc:             enc,
 		compress:        cfg.Compress,
-		compressWorkers: cfg.CompressWorkers,
+		compressWorkers: workers,
 	}, nil
 }
 
@@ -199,10 +213,7 @@ func (s *Server) Run(ctx context.Context) (err error) {
 	// finished, panicking the daemon on an ordinary shutdown.
 	var pipeline *chunkPipeline
 	if s.compress {
-		pipeline, err = newChunkPipeline(s.compressWorkers, s.b.chunk)
-		if err != nil {
-			return err
-		}
+		pipeline = newChunkPipeline(s.enc, s.compressWorkers, s.chunkSize, s.b.chunk)
 		defer pipeline.close()
 	}
 
@@ -248,7 +259,8 @@ func (s *Server) Run(ctx context.Context) (err error) {
 		}
 		hasher.Reset()
 
-		// arena holds every chunk message of this ledger in one allocation.
+		// arena holds this ledger's raw chunk reads in one allocation — and,
+		// when not compressing, the published messages themselves.
 		// Published messages are immutable and the broadcaster pins the whole
 		// flow until the next BEGIN anyway, so a per-ledger arena preserves
 		// both while collapsing ~58 per-chunk allocations per stress ledger —
@@ -328,8 +340,7 @@ func (s *Server) Run(ctx context.Context) (err error) {
 		}
 		if pipeline != nil {
 			// Every chunk is published, in order, before END announces the
-			// counts and checksum they must match — and before the next
-			// ledger's arena replaces the bytes they were read from.
+			// counts and checksum they must match.
 			pipeline.flush()
 		}
 		// A source that declared a size must deliver exactly it: publishing a
@@ -721,12 +732,10 @@ func (s *Server) writeRingFlow(
 	if err := s.write(ctx, conn, b); err != nil {
 		return err
 	}
-	enc := s.ringEncoder()
-	defer s.putRingEncoder(enc)
 	var idx uint32
 	for off := 0; off < len(raw); off += s.chunkSize {
 		chunk := raw[off:min(off+s.chunkSize, len(raw))]
-		b = encodeChunk(enc, b[:0], seq, idx, chunk)
+		b = encodeChunk(s.enc, b[:0], seq, idx, chunk)
 		if err := s.write(ctx, conn, b); err != nil {
 			return err
 		}

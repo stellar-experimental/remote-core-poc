@@ -10,9 +10,10 @@ import (
 
 // Chunk decompression. The server compresses each chunk independently and
 // opportunistically (see internal/server/compress.go), so a flow can mix
-// codecs and the client decides per chunk. Decompression appends straight
-// into the assembly buffer: no intermediate copy, and the buffer keeps its
-// capacity across ledgers.
+// codecs and the client decides per chunk. A raw payload appends straight
+// into the assembly; a compressed one expands into a reused scratch buffer
+// first, which is what bounds ONE chunk's expansion exactly (see
+// newDecoder).
 //
 // One core decompresses ~2.2 GB/s, against the ~1.9 GB/s a source can emit,
 // so a single decoder keeps pace with a live flow.

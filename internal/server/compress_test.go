@@ -53,7 +53,7 @@ func expand(t *testing.T, m wire.Message) []byte {
 // verbatim under CodecRaw rather than paying to inflate, and either way the
 // bytes a receiver recovers are exactly the bytes that went in.
 func TestEncodeChunkRoundTrips(t *testing.T) {
-	enc, err := newEncoder()
+	enc, err := newEncoder(2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,12 +103,14 @@ func TestEncodeChunkRoundTrips(t *testing.T) {
 func TestChunkPipelinePublishesInOrder(t *testing.T) {
 	const chunks = 64
 	var got [][]byte
-	p, err := newChunkPipeline(4, func(msg []byte) {
-		got = append(got, append([]byte(nil), msg...))
-	})
+	penc, err := newEncoder(4)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer penc.Close()
+	p := newChunkPipeline(penc, 4, 256<<10, func(msg []byte) {
+		got = append(got, append([]byte(nil), msg...))
+	})
 	// Payloads of wildly different compressibility make the workers finish out
 	// of order if anything but submission order governs publication.
 	raws := make([][]byte, chunks)

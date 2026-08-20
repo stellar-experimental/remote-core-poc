@@ -42,7 +42,7 @@ P1/P2 uncompressed only to CONFIRM the ~7 ms placement-group figure on real
 NICs; the gate itself is a post-compression measurement.
 
 **Cell P1 — acceptance shape, simulated window (the gate cell).**
-Server: `corestreamd -source synthetic -synthetic-size 15184000
+Server: `corestreamd -compress=false -source synthetic -synthetic-size 15184000
 -synthetic-interval 600ms -emit-window 7500us -chunk-size 262144
 -synthetic-count 1015`. Client: `-end 1005`.
 ≥1,000 ledgers. Expected: delivery p50 ~2.5–3.5 ms / p99 ~3–4.5 ms.
@@ -51,8 +51,8 @@ on n ≥ 1,000 pushing warmup past p99.9). Pace at 7.5 ms — the measured core
 burst — NOT the 15 ms this repo once assumed.
 
 **Cell P2 — true end-to-end, real core.**
-Server: `corestreamd -source pipe -pipe-cmd "stellar-core apply-load --conf
-apply-load-sac6000-meta.cfg"` (config in the de-risk record; 100 ledgers at
+Server: `corestreamd -compress=false -source pipe -pipe-cmd "stellar-core apply-load
+--conf apply-load-sac6000-meta.cfg"` (config in the de-risk record; 100 ledgers at
 ~2 s apply pace, mean frame 14.48 MiB). Client: unbounded, stream ends when
 core exits. Expected ≈ P1 at n=100 (single-box read: p50 3.48 / p99 4.48
 through the emulator; the real wire should land at or under it).

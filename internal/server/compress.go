@@ -17,198 +17,183 @@ import (
 // at ~2 MB and ~3.2 ms of wire: it fits inside the window with room, and the
 // link rate stops mattering.
 //
-// Compression is per chunk and opportunistic (a payload that does not shrink
-// ships CodecRaw), because a chunk must go out the moment it exists and the
-// relay never sees a whole ledger before forwarding its first bytes. It is
-// also done ONCE per chunk, not once per subscriber: the broadcaster
-// publishes one immutable message that every subscriber writes to its own
-// socket, so the cost is flat in fan-out.
+// Frames are per chunk, and independent, because the encode is parallel — a
+// zstd stream is serial, and one core does not keep up with the source — and
+// because a ring replay compresses chunks in isolation, with no flow to share
+// a window with. Compression is also opportunistic: a payload that does not
+// shrink ships CodecRaw, which is what an incompressible ledger does end to
+// end.
+//
+// It runs ONCE per chunk, not once per subscriber: the broadcaster publishes
+// one immutable message that every subscriber writes to its own socket, so
+// the cost is flat in fan-out.
 
-// compressWorkersDefault is what the live path uses when a caller does not
-// choose. Core drains its meta into the pipe at ~1.9 GB/s and one core
-// compresses ~450 MiB/s, so four workers keep the pipeline ahead of the
-// source; going wider adds goroutines without buying window.
-const compressWorkersDefault = 4
+const (
+	// compressWorkersDefault is what the live path uses when a caller does
+	// not choose. Core drains its meta into the pipe at ~1.9 GB/s and one
+	// core compresses ~450 MiB/s of real meta, so four workers keep the
+	// pipeline ahead of the source; going wider adds goroutines without
+	// buying window.
+	compressWorkersDefault = 4
 
-// maxCompressWorkers bounds the flag: past this the goroutines and encoders
-// cost more than the parallelism buys, and a fat-fingered value should be a
-// startup error rather than tens of thousands of encoders.
-const maxCompressWorkers = 64
+	// maxCompressWorkers bounds the flag: past this the goroutines cost more
+	// than the parallelism buys.
+	maxCompressWorkers = 64
 
-// newEncoder builds the shared encoder configuration: SpeedFastest, since the
-// pipeline must stay ahead of the source, and single-goroutine because the
-// parallelism lives in the worker pool below (one encoder per worker).
-func newEncoder() (*zstd.Encoder, error) {
+	// pendingChunks is how many chunks may be queued for publication. It is
+	// sized by the LEDGER, not by the worker count: the source must be able
+	// to hand off a whole ledger's chunks without ever waiting on the queue,
+	// because a source that waits stops draining core's meta pipe. A stress
+	// ledger is ~58 chunks at the default size; 1024 slots is 8 KB once per
+	// run and leaves the source unblocked at any chunk size worth using.
+	pendingChunks = 1024
+
+	// encodeSlots bounds chunks in flight INSIDE the encoders. Past ~16 the
+	// extra depth only defers compression into flush(), landing it on the
+	// post-emission tail; below it, the raw fallback fires for chunks that
+	// had time to compress.
+	encodeSlots = 16
+)
+
+// newEncoder builds the shared encoder: SpeedFastest, since the pipeline must
+// stay ahead of the source, and a concurrency of workers+2 because
+// zstd.Encoder is itself a pool of encoder states gated by a channel —
+// EncodeAll borrows one per call, so the live workers and the retention-ring
+// replays share this one object without contending for the same state, and
+// the +2 keeps a replay from starving the live path.
+func newEncoder(workers int) (*zstd.Encoder, error) {
 	return zstd.NewWriter(nil,
 		zstd.WithEncoderLevel(zstd.SpeedFastest),
-		zstd.WithEncoderConcurrency(1))
+		zstd.WithEncoderConcurrency(workers+2))
 }
 
-// encodeChunk frames one chunk message, compressing the payload when that
-// makes it smaller. It appends to dst and returns the framed message.
+// encodeChunk frames one chunk message into dst, compressing the payload when
+// that makes it smaller. dst is a scratch buffer the caller reuses; the
+// returned slice aliases it.
 func encodeChunk(enc *zstd.Encoder, dst []byte, seq, idx uint32, raw []byte) []byte {
 	if enc != nil {
-		header := wire.AppendChunkHeader(dst, seq, idx, wire.CodecZstd)
+		header := wire.AppendChunkHeader(dst[:0], seq, idx, wire.CodecZstd)
 		if msg := enc.EncodeAll(raw, header); len(msg)-len(header) < len(raw) {
 			return msg
 		}
-		// Incompressible: zstd's frame is no smaller than the bytes it wraps,
-		// so ship them verbatim. Reuse dst's original capacity rather than the
-		// grown frame, so the fallback costs one append, not two.
 	}
-	return wire.AppendChunk(dst, seq, idx, wire.CodecRaw, raw)
+	return wire.AppendChunk(dst[:0], seq, idx, wire.CodecRaw, raw)
 }
 
 // chunkPipeline compresses chunks concurrently and publishes them in
-// submission order. It lives for the whole run, not per ledger: creating
-// encoders per ledger would churn four zstd table sets and five goroutines
-// every 600 ms, landing GC work in the measured post-emission tail.
-//
-// The source loop must never block on compression — a blocked drain backs up
-// into core's meta pipe and eventually stalls ledger apply — so a submission
-// that would wait for a busy encoder is framed raw inline instead. Ordering
-// is preserved either way, because every chunk (compressed or not) passes
-// through the same ordered queue.
+// submission order. It lives for the whole run: a per-ledger pipeline would
+// churn goroutines every 600 ms, and — the reason this is not merely
+// wasteful — every early return in the source loop would leak its publisher,
+// which then publishes into a broadcaster that Run has already finished.
 type chunkPipeline struct {
-	work    chan *chunkJob
-	ordered chan *chunkJob
-	publish func(msg []byte)
-	wg      sync.WaitGroup
-	pubDone chan struct{}
-	stop    sync.Once
+	enc       *zstd.Encoder
+	chunkSize int
+	work      chan *chunkJob
+	ordered   chan *chunkJob
+	publish   func(msg []byte)
+	inflight  sync.WaitGroup // submitted but not yet published
+	workers   sync.WaitGroup
+	pubDone   chan struct{}
+	stop      sync.Once
 }
 
 // chunkJob is one chunk in flight: raw bytes in, framed message out. raw must
-// stay valid until done closes, which the per-ledger arena guarantees by
-// carving disjoint regions and by flush() draining before the arena is reused.
+// stay valid until done closes, which the per-ledger arena guarantees and
+// flush() enforces before END.
 type chunkJob struct {
 	seq  uint32
 	idx  uint32
 	raw  []byte
 	out  []byte
 	done chan struct{}
-	// flushed, when non-nil, marks a barrier rather than a chunk: the
-	// publisher closes it once every job queued before it has been published.
-	flushed chan struct{}
 }
 
-// newChunkPipeline starts workers encoders and one publisher. publish is
-// called from the publisher goroutine only, in submission order.
-func newChunkPipeline(workers int, publish func(msg []byte)) (*chunkPipeline, error) {
-	if workers < 1 {
-		workers = compressWorkersDefault
-	}
-	if workers > maxCompressWorkers {
-		return nil, fmt.Errorf("compression: %d workers is over the %d cap", workers, maxCompressWorkers)
-	}
+// newChunkPipeline starts workers encoders and one publisher. enc is shared
+// (see newEncoder); publish is called from the publisher goroutine only, in
+// submission order.
+func newChunkPipeline(enc *zstd.Encoder, workers, chunkSize int, publish func(msg []byte)) *chunkPipeline {
 	p := &chunkPipeline{
-		work:    make(chan *chunkJob, workers),
-		ordered: make(chan *chunkJob, workers*2),
-		publish: publish,
-		pubDone: make(chan struct{}),
+		enc:       enc,
+		chunkSize: chunkSize,
+		work:      make(chan *chunkJob, encodeSlots),
+		ordered:   make(chan *chunkJob, pendingChunks),
+		publish:   publish,
+		pubDone:   make(chan struct{}),
 	}
-	encoders := make([]*zstd.Encoder, 0, workers)
 	for range workers {
-		enc, err := newEncoder()
-		if err != nil {
-			// Stop the workers already started before returning, or they
-			// block on p.work forever with nothing to drain them.
-			close(p.work)
-			p.wg.Wait()
-			for _, e := range encoders {
-				e.Close()
-			}
-			return nil, fmt.Errorf("compression: %w", err)
-		}
-		encoders = append(encoders, enc)
-		p.wg.Add(1)
-		go func(enc *zstd.Encoder) {
-			defer p.wg.Done()
-			defer enc.Close()
+		p.workers.Add(1)
+		go func() {
+			defer p.workers.Done()
+			// One scratch buffer per worker: the message is encoded here and
+			// then copied out at its exact size, so neither codec grows a
+			// buffer mid-encode and the published allocation is never the
+			// 4x-oversized fallback the compressed sizing would imply.
+			scratch := make([]byte, 0, wire.ChunkHeaderSize+p.chunkSize)
 			for job := range p.work {
-				job.out = encodeChunk(enc, job.out[:0], job.seq, job.idx, job.raw)
+				msg := encodeChunk(p.enc, scratch, job.seq, job.idx, job.raw)
+				if cap(msg) > cap(scratch) {
+					scratch = msg[:0] // an oversized chunk grew it; keep the growth
+				}
+				job.out = append(make([]byte, 0, len(msg)), msg...)
 				close(job.done)
 			}
-		}(enc)
+		}()
 	}
 	go func() {
 		defer close(p.pubDone)
 		for job := range p.ordered {
-			if job.flushed != nil {
-				close(job.flushed)
-				continue
-			}
 			<-job.done
 			p.publish(job.out)
+			p.inflight.Done()
 		}
 	}()
-	return p, nil
+	return p
 }
 
-// submit queues one chunk. It never waits for an encoder: if every worker is
-// busy the chunk is framed raw on this goroutine, which keeps the source
-// draining core's pipe at the cost of one uncompressed chunk.
+// submit queues one chunk. It never waits: the ordered queue holds a whole
+// ledger, and if every encoder is busy the chunk is framed raw on this
+// goroutine, so the source keeps draining core's pipe.
 func (p *chunkPipeline) submit(seq, idx uint32, raw []byte) {
-	job := &chunkJob{
-		seq: seq, idx: idx, raw: raw,
-		// One allocation per chunk, sized for the header plus a compressed
-		// payload; the published message must outlive the ledger, so these
-		// are never recycled.
-		out:  make([]byte, 0, wire.ChunkHeaderSize+len(raw)/4+64),
-		done: make(chan struct{}),
-	}
+	job := &chunkJob{seq: seq, idx: idx, raw: raw, done: make(chan struct{})}
+	p.inflight.Add(1)
 	p.ordered <- job
 	select {
 	case p.work <- job:
 	default:
-		job.out = encodeChunk(nil, job.out[:0], seq, idx, raw)
+		msg := encodeChunk(nil, make([]byte, 0, wire.ChunkHeaderSize+len(raw)), seq, idx, raw)
+		job.out = msg
 		close(job.done)
 	}
 }
 
 // flush blocks until every chunk submitted so far has been published. The
-// caller must call it before publishing the ledger's END — which announces
-// the chunk count — and before reusing the buffers the chunks were read into.
-func (p *chunkPipeline) flush() {
-	barrier := &chunkJob{flushed: make(chan struct{})}
-	p.ordered <- barrier
-	<-barrier.flushed
-}
+// caller must call it before publishing the ledger's END, which announces the
+// chunk count and the checksum those chunks must match. submit and flush are
+// both called from the source goroutine, so every Add happens before this
+// Wait in program order.
+func (p *chunkPipeline) flush() { p.inflight.Wait() }
 
-// close drains and stops the pipeline. It is safe to call more than once and
-// safe to call with nothing submitted.
+// close drains and stops the pipeline. Safe to call more than once, and with
+// nothing submitted.
 func (p *chunkPipeline) close() {
 	p.stop.Do(func() {
 		close(p.work)
-		p.wg.Wait()
+		p.workers.Wait()
 		close(p.ordered)
 		<-p.pubDone
 	})
 }
 
-// ringEncoder borrows an encoder for a retention-ring replay, or nil when the
-// server ships raw chunks. Replays are not latency-critical, so they encode on
-// the serving goroutine; pooling keeps a reconnect storm from allocating one
-// encoder per subscriber per ledger.
-func (s *Server) ringEncoder() *zstd.Encoder {
-	if !s.compress {
-		return nil
-	}
-	if enc, ok := s.ringEncPool.Get().(*zstd.Encoder); ok {
-		return enc
-	}
-	enc, err := newEncoder()
-	if err != nil {
-		// Only invalid options can fail here, and they are compile-time
-		// constants; ship raw rather than failing a replay.
-		s.log.Warn("compression unavailable for ring replay", "error", err)
-		return nil
-	}
-	return enc
-}
-
-func (s *Server) putRingEncoder(enc *zstd.Encoder) {
-	if enc != nil {
-		s.ringEncPool.Put(enc)
+// validateCompressWorkers checks an operator-supplied worker count. It is
+// called from New so a bad value fails before the listener binds, not after
+// the daemon reports itself up.
+func validateCompressWorkers(n int) (int, error) {
+	switch {
+	case n == 0:
+		return compressWorkersDefault, nil
+	case n < 0 || n > maxCompressWorkers:
+		return 0, fmt.Errorf("compress workers %d is outside [1,%d]", n, maxCompressWorkers)
+	default:
+		return n, nil
 	}
 }
