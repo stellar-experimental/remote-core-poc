@@ -11,8 +11,12 @@ real ENA/interrupt behavior under the real wire.
 
 ## Preconditions (without these the numbers are unreadable)
 
-1. Two c6id.8xlarge in the **same cluster placement group** (same-AZ RTT
-   ~100 µs is what the projection assumes).
+1. Two c6id.8xlarge in the **same cluster placement group**. This is not only
+   about the ~100 µs RTT: EC2 caps a SINGLE TCP flow at ~5 Gbit/s outside a
+   placement group and ~10 Gbit/s inside one (measured on these boxes: 4.96
+   Gbit/s one flow, 12.26 Gbit/s across four). This transport is one
+   WebSocket, so it gets the single-flow number, and a 14.48 MiB ledger needs
+   24.3 ms of wire at 5 Gbit/s against a 7.5 ms emission window.
 2. **chrony disciplined to the AWS Time Sync PTP hardware clock on BOTH
    boxes** (`/dev/ptp0`, `refclock PHC`): delivery is a cross-machine
    timestamp difference and plain NTP's ±0.5–1 ms error is the same order as
@@ -26,6 +30,16 @@ real ENA/interrupt behavior under the real wire.
 
 Server box runs `corestreamd`, client box runs `benchrunner -mode remote
 -url ws://<server>:8462 -csv <cell>.csv`. One cell at a time.
+
+**Read this before P1: uncompressed, the gate cannot pass on one flow.**
+Measured on the single-box rig at honest single-flow rates (330 ledgers each,
+7.5 ms window): 5 Gbit/s full ledger → delivery p99 **19.17 ms**; 10 Gbit/s
+full ledger → p99 **7.13 ms**; at the measured compressed size (2.14 MB,
+zstd 7.08×) → p99 **1.62 ms** at 5 Gbit/s and **1.61 ms** at 10 Gbit/s. The
+two compressed numbers being equal is the mechanism working: once the
+transfer fits inside the emission window, link rate stops mattering. So run
+P1/P2 uncompressed only to CONFIRM the ~7 ms placement-group figure on real
+NICs; the gate itself is a post-compression measurement.
 
 **Cell P1 — acceptance shape, simulated window (the gate cell).**
 Server: `corestreamd -source synthetic -synthetic-size 15184000
