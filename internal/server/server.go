@@ -100,11 +100,12 @@ type Server struct {
 	log       *slog.Logger
 	chunkSize int
 
-	// enc is the one encoder the live pipeline's workers and every ring
-	// replay share; zstd.Encoder is itself a pool of encoder states, so
-	// concurrent EncodeAll calls do not contend. Nil when not compressing.
+	// enc is the LIVE pipeline's encoder and ringEnc the retention ring's.
+	// They are separate pools on purpose: zstd.Encoder gates a fixed set of
+	// encoder states, so one shared pool let a catch-up subscriber throttle
+	// the source loop (see newEncoder). Both nil when not compressing.
 	enc             *zstd.Encoder
-	ringEnc         *zstd.Encoder // separate pool: replays must not throttle the source
+	ringEnc         *zstd.Encoder
 	compressWorkers int
 	rawFallbacks    atomic.Uint64
 
@@ -152,10 +153,10 @@ func New(cfg Config) (*Server, error) {
 		// the listener binds, not after the daemon reports itself up. The
 		// ring gets its own encoder: see newEncoder on why sharing one lets a
 		// subscriber throttle the source loop.
-		if enc, err = newEncoder(workers); err != nil {
+		if enc, err = newEncoder(workers, chunkSize); err != nil {
 			return nil, fmt.Errorf("server: compression: %w", err)
 		}
-		if ringEnc, err = newEncoder(ringEncoderConcurrency); err != nil {
+		if ringEnc, err = newEncoder(ringEncoderConcurrency, chunkSize); err != nil {
 			return nil, fmt.Errorf("server: compression: %w", err)
 		}
 	}
@@ -211,9 +212,9 @@ func (s *Server) Run(ctx context.Context) (err error) {
 
 	s.log.Info("source loop starting", "range", s.rng.String(), "chunk_size", s.chunkSize)
 
-	// One pipeline for the whole run. A per-ledger pipeline would churn four
-	// encoders and five goroutines every 600 ms, and — the reason this is not
-	// merely wasteful — every early return below would leak its publisher,
+	// One pipeline for the whole run. A per-ledger pipeline would churn five
+	// goroutines every 600 ms, and — the reason this is not merely
+	// wasteful — every early return below would leak its publisher,
 	// which then publishes into a broadcaster this function has already
 	// finished, panicking the daemon on an ordinary shutdown.
 	// s.enc is nil when not compressing, which makes this a pass-through that

@@ -8,12 +8,14 @@ import (
 	"math/rand"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
 
+	"github.com/coder/websocket"
 	"github.com/klauspost/compress/zstd"
 
 	"github.com/stellar-experimental/remote-core-poc/internal/store"
@@ -55,7 +57,7 @@ func expand(t *testing.T, m wire.Message) []byte {
 // verbatim under CodecRaw rather than paying to inflate, and either way the
 // bytes a receiver recovers are exactly the bytes that went in.
 func TestEncodeChunkRoundTrips(t *testing.T) {
-	enc, err := newEncoder(4)
+	enc, err := newEncoder(4, 256<<10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +107,7 @@ func TestEncodeChunkRoundTrips(t *testing.T) {
 func TestChunkPipelinePublishesInOrder(t *testing.T) {
 	const chunks = 64
 	var got [][]byte
-	penc, err := newEncoder(6)
+	penc, err := newEncoder(6, 256<<10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,4 +269,83 @@ func mustStore(t *testing.T) *store.Store {
 		t.Fatal(err)
 	}
 	return ring
+}
+
+// TestRingReplayChunksAreCompressed pins what the encoder-separation test
+// cannot: that ring replays compress AT ALL. Both "replays never compress"
+// and "replays borrow the live encoder" pass every other test in this
+// package — the first because the client accepts either codec, the second
+// because both pools emit identical bytes. Only reading the codec byte off
+// the wire catches the first; the second is behaviourally invisible and is
+// pinned by construction in New instead.
+func TestRingReplayChunksAreCompressed(t *testing.T) {
+	payloads := make([][]byte, 3)
+	for i := range payloads {
+		payloads[i] = bytes.Repeat(fmt.Appendf(nil, "ring-%d-meta-", i), 2000)
+	}
+	h := startHarness(t, harnessOpts{
+		start: 1, count: uint32(len(payloads)),
+		dumpDir: writeDump(t, 1, payloads...), compress: true, chunkSize: wire.MinChunkSize,
+	})
+	h.waitForLedger(t, uint32(len(payloads)))
+
+	// Subscribe to a range the source has already finished, so every chunk
+	// comes from the retention ring.
+	conn, _, err := websocket.Dial(t.Context(),
+		fmt.Sprintf("%s%s?start=1&end=%d", strings.Replace(h.url, "http", "ws", 1), wire.StreamPath, len(payloads)), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.CloseNow()
+	conn.SetReadLimit(int64(wire.MaxChunkSize + wire.ChunkHeaderSize))
+
+	var chunks, compressed int
+	for chunks < 3 {
+		typ, data, rerr := conn.Read(t.Context())
+		if rerr != nil {
+			t.Fatalf("read: %v", rerr)
+		}
+		if typ != websocket.MessageBinary {
+			continue
+		}
+		m, derr := wire.Decode(data)
+		if derr != nil {
+			t.Fatalf("decode: %v", derr)
+		}
+		if m.Type != wire.TypeChunk {
+			continue
+		}
+		chunks++
+		if m.Codec == wire.CodecZstd {
+			compressed++
+		}
+	}
+	if compressed != chunks {
+		t.Fatalf("ring replay shipped %d/%d chunks compressed", compressed, chunks)
+	}
+}
+
+func TestValidateCompressWorkers(t *testing.T) {
+	for _, tc := range []struct {
+		in      int
+		want    int
+		wantErr bool
+	}{
+		{in: 0, want: compressWorkersDefault},
+		{in: 1, want: 1},
+		{in: maxCompressWorkers, want: maxCompressWorkers},
+		{in: -1, wantErr: true},
+		{in: maxCompressWorkers + 1, wantErr: true},
+	} {
+		got, err := validateCompressWorkers(tc.in)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("validateCompressWorkers(%d) = %d, want an error", tc.in, got)
+			}
+			continue
+		}
+		if err != nil || got != tc.want {
+			t.Errorf("validateCompressWorkers(%d) = %d, %v; want %d, nil", tc.in, got, err, tc.want)
+		}
+	}
 }

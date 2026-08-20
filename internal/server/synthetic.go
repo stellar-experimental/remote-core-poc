@@ -80,15 +80,8 @@ func (s *SyntheticStream) RawLedgers(
 // size. Regenerating it is how a consumer checks that what arrived over the
 // network is what the source produced.
 func SyntheticPayload(seq uint32, size int) []byte {
-	return SyntheticPayloadMode(seq, size, false)
-}
-
-// SyntheticPayloadMode is SyntheticPayload with the payload shape chosen
-// explicitly; compressible must match the source's configuration or a
-// verifying consumer will compare against the wrong bytes.
-func SyntheticPayloadMode(seq uint32, size int, compressible bool) []byte {
 	buf := make([]byte, size)
-	FillSyntheticPayload(buf, seq, compressible)
+	FillSyntheticPayload(buf, seq, false)
 	return buf
 }
 

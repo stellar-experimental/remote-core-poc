@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"fmt"
+	"math/bits"
 	"sync"
 	"sync/atomic"
 
@@ -39,8 +40,9 @@ const (
 	compressWorkersDefault = 4
 
 	// maxCompressWorkers is a sanity bound on operator input. The goroutines
-	// are free; the encoder states are not (~9.8 MiB of pool at concurrency
-	// 6, ~25 MiB at 66), and nothing on this hardware profits past a few.
+	// are free; the encoder states are not — with the window sized to a
+	// chunk, the default pools cost ~9.5 MiB and this ceiling ~104 MiB — and
+	// nothing on this hardware profits past a few workers anyway.
 	maxCompressWorkers = 64
 
 	// pendingChunks is how many chunks may be queued for publication. It is
@@ -53,7 +55,7 @@ const (
 
 	// ringEncoderConcurrency is how many retention-ring replays may compress
 	// at once. Replays are throughput work, not latency work: queueing among
-	// themselves is fine, and each state costs ~256 KiB, so this stays small.
+	// themselves is fine, and each state costs ~1.6 MiB, so this stays small.
 	ringEncoderConcurrency = 2
 
 	// encodeSlots bounds the queue INTO the encoders (chunks actually in
@@ -75,10 +77,17 @@ const (
 // the live workers then waited for, so live chunks took submit's raw fallback
 // — measured 13% of chunks at 8 catch-up subscribers, 37% at 16, precisely
 // when the link is busiest and compression matters most.
-func newEncoder(concurrency int) (*zstd.Encoder, error) {
+func newEncoder(concurrency, chunkSize int) (*zstd.Encoder, error) {
 	return zstd.NewWriter(nil,
 		zstd.WithEncoderLevel(zstd.SpeedFastest),
 		zstd.WithEncoderConcurrency(concurrency),
+		// A frame never spans more than one chunk, so the default 8 MiB
+		// window is history no match can reach: it costs 8.79 MiB per encoder
+		// state instead of 1.62 MiB (51.5 vs 9.5 MiB for the default pools,
+		// and 566 vs 104 MiB at the worker ceiling) and buys nothing —
+		// emitted frames are byte-identical either way. chunkSize is already
+		// validated into [4 KiB, 8 MiB], inside zstd's legal window range.
+		zstd.WithWindowSize(1<<bits.Len(uint(chunkSize-1))),
 		// No per-frame checksum: END carries xxhash64 over the whole RAW
 		// ledger and the client verifies it, so a frame CRC detects nothing
 		// extra while costing the decoder ~23% (measured on real pubnet
@@ -111,7 +120,6 @@ type chunkPipeline struct {
 	// chunk, so a flow that quietly stops compressing looks identical on the
 	// wire to one that never needed to.
 	fallbacks *atomic.Uint64
-	chunkSize int
 	work      chan *chunkJob
 	ordered   chan *chunkJob
 	publish   func(msg []byte)
@@ -133,9 +141,9 @@ type chunkJob struct {
 	done chan struct{}
 }
 
-// newChunkPipeline starts workers encoders and one publisher. enc is shared
-// (see newEncoder); publish is called from the publisher goroutine only, in
-// submission order.
+// newChunkPipeline starts workers encoders and one publisher. enc is the
+// LIVE encoder — replays have their own, see newEncoder — and publish is
+// called from the publisher goroutine only, in submission order.
 func newChunkPipeline(enc *zstd.Encoder, workers, chunkSize int, fallbacks *atomic.Uint64, publish func(msg []byte)) *chunkPipeline {
 	if enc == nil {
 		// Not compressing: submit frames in place and publishes inline, so
@@ -144,9 +152,7 @@ func newChunkPipeline(enc *zstd.Encoder, workers, chunkSize int, fallbacks *atom
 		return &chunkPipeline{publish: publish}
 	}
 	p := &chunkPipeline{
-		enc:       enc,
 		fallbacks: fallbacks,
-		chunkSize: chunkSize,
 		work:      make(chan *chunkJob, encodeSlots),
 		ordered:   make(chan *chunkJob, pendingChunks),
 		publish:   publish,
@@ -164,9 +170,9 @@ func newChunkPipeline(enc *zstd.Encoder, workers, chunkSize int, fallbacks *atom
 			// frame of an incompressible chunk is LARGER than its input, and
 			// a scratch that has to grow is reallocated on every such chunk
 			// (measured 47% slower for the sake of 29 bytes).
-			scratch := make([]byte, 0, wire.ChunkHeaderSize+p.enc.MaxEncodedSize(p.chunkSize))
+			scratch := make([]byte, 0, wire.ChunkHeaderSize+enc.MaxEncodedSize(chunkSize))
 			for job := range p.work {
-				msg := encodeChunk(p.enc, scratch, job.seq, job.idx, job.msg[wire.ChunkHeaderSize:])
+				msg := encodeChunk(enc, scratch, job.seq, job.idx, job.msg[wire.ChunkHeaderSize:])
 				job.out = bytes.Clone(msg)
 				close(job.done)
 			}
@@ -192,7 +198,7 @@ func newChunkPipeline(enc *zstd.Encoder, workers, chunkSize int, fallbacks *atom
 // pipe. Encoders running at par with the source (see compressWorkersDefault)
 // make that the designed steady state, not an edge case.
 func (p *chunkPipeline) submit(seq, idx uint32, msg []byte) {
-	if p.enc == nil {
+	if p.work == nil { // pass-through: frame and publish inline
 		wire.PutChunkHeader(msg, seq, idx, wire.CodecRaw)
 		p.publish(msg)
 		return
