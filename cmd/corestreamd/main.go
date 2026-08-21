@@ -61,9 +61,11 @@ type options struct {
 	dataDir     string
 	logLevel    string
 
-	chunkSize  int
-	emitWindow time.Duration
-	cadence    time.Duration
+	chunkSize       int
+	compress        bool
+	compressWorkers int
+	emitWindow      time.Duration
+	cadence         time.Duration
 
 	coreBinary        string
 	coreConfig        string
@@ -75,9 +77,10 @@ type options struct {
 	pipeCmd   string
 	fileCount uint
 
-	syntheticSize     int
-	syntheticInterval time.Duration
-	syntheticCount    uint
+	syntheticSize         int
+	syntheticCompressible bool
+	syntheticInterval     time.Duration
+	syntheticCount        uint
 }
 
 // parseFlags reads args, writing usage and flag errors to out.
@@ -93,6 +96,11 @@ func parseFlags(out io.Writer, args []string) (options, error) {
 	fs.StringVar(&o.logLevel, "log-level", "info", "log level: debug|info|warn|error")
 
 	fs.IntVar(&o.chunkSize, "chunk-size", wire.DefaultChunkSize, "chunk payload bytes")
+	fs.BoolVar(&o.compress, "compress", true,
+		"compress each chunk with zstd when that shrinks it (real meta compresses ~7.5x, which is "+
+			"what lets a ledger's transfer finish inside the source's emission window on one TCP flow)")
+	fs.IntVar(&o.compressWorkers, "compress-workers", 0,
+		"chunks compressed concurrently (0 = 4, sized to stay ahead of core's pipe drain)")
 	fs.DurationVar(&o.emitWindow, "emit-window", 15*time.Millisecond,
 		"pace each file/synthetic ledger's bytes over this window (0 = all at once; ignored for captive)")
 	fs.DurationVar(&o.cadence, "cadence", 600*time.Millisecond,
@@ -111,6 +119,10 @@ func parseFlags(out io.Writer, args []string) (options, error) {
 	fs.UintVar(&o.fileCount, "file-count", 0, "ledgers to emit from the dump (0 = cycle it endlessly)")
 
 	fs.IntVar(&o.syntheticSize, "synthetic-size", server.DefaultSyntheticSize, "synthetic ledger payload bytes")
+	fs.BoolVar(&o.syntheticCompressible, "synthetic-compressible", false,
+		"fabricate meta-SHAPED (compressible) synthetic payloads instead of incompressible noise; "+
+			"required to benchmark --compress against the synthetic source, which otherwise only "+
+			"measures discarded compression work")
 	fs.DurationVar(&o.syntheticInterval, "synthetic-interval", time.Second, "synthetic ledger close interval")
 	fs.UintVar(&o.syntheticCount, "synthetic-count", 0, "synthetic ledgers to emit (0 = endless)")
 
@@ -275,7 +287,7 @@ func run() error {
 		// sleeps, so PacedSource owns the whole schedule and the emit window
 		// nests inside the interval instead of stretching it.
 		source = server.PacedSource(
-			server.NewSyntheticStream(server.SyntheticConfig{Size: o.syntheticSize}),
+			server.NewSyntheticStream(server.SyntheticConfig{Size: o.syntheticSize, Compressible: o.syntheticCompressible}),
 			o.emitWindow, o.syntheticInterval)
 		rng = server.CountedRange(start, o.ledgerCount())
 	case "file":
@@ -327,11 +339,13 @@ func run() error {
 	}
 
 	srv, err := server.New(server.Config{
-		Source:    source,
-		ChunkSize: o.chunkSize,
-		Range:     rng,
-		Store:     ring,
-		Logger:    logger,
+		Source:          source,
+		ChunkSize:       o.chunkSize,
+		Compress:        o.compress,
+		CompressWorkers: o.compressWorkers,
+		Range:           rng,
+		Store:           ring,
+		Logger:          logger,
 	})
 	if err != nil {
 		return err

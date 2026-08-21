@@ -3,12 +3,21 @@
 // Each ledger travels as a BEGIN / CHUNK* / END message flow, so the server
 // can put the first bytes on the wire while the source is still emitting the
 // rest — the overlap that one-message-per-ledger framing (this protocol's
-// retired predecessor, version byte 0x01) makes impossible:
+// retired predecessor) makes impossible:
 //
 //	BEGIN [1B ver=0x02][1B type=0x10][4B BE seq][8B BE emitStartUnixNano]
-//	CHUNK [1B ver=0x02][1B type=0x11][4B BE seq][4B BE chunkIdx][payload bytes]
+//	CHUNK [1B ver=0x02][1B type=0x11][4B BE seq][4B BE chunkIdx][1B codec][payload]
 //	END   [1B ver=0x02][1B type=0x12][4B BE seq][4B BE chunkCount]
 //	      [8B BE totalLen][8B BE emitEndUnixNano][8B BE xxhash64-of-raw]
+//
+// A chunk's codec byte says how its payload is encoded: CodecRaw carries the
+// ledger's bytes verbatim, CodecZstd carries one independent zstd frame the
+// receiver expands before appending. Compression is per chunk and
+// opportunistic — a payload that does not shrink ships raw — because a chunk
+// must go out the moment it exists, and a relay cannot know a ledger's
+// compressibility before it has the ledger. The counts and the checksum in
+// END always describe the RAW ledger, so integrity checking is identical
+// whatever each chunk chose.
 //
 // emitStartUnixNano is the server clock at the FIRST byte of the ledger from
 // its source, emitEndUnixNano at the LAST byte: together they make both the
@@ -30,7 +39,10 @@ import (
 
 // Protocol constants.
 const (
-	// Version is the protocol version byte.
+	// Version is the protocol version byte: a cheap "is this even our
+	// protocol" check on the first byte of every message. It is not a
+	// compatibility mechanism — both ends of this prototype always ship
+	// together, and nothing negotiates.
 	Version byte = 0x02
 
 	// TypeBegin opens one ledger's chunk flow and carries its emit-start stamp.
@@ -44,8 +56,8 @@ const (
 	// BeginSize is the whole BEGIN message: ver, type, seq, emitStart.
 	BeginSize = 1 + 1 + 4 + 8
 	// ChunkHeaderSize is the fixed prefix of a CHUNK message: ver, type, seq,
-	// chunkIdx. The payload follows.
-	ChunkHeaderSize = 1 + 1 + 4 + 4
+	// chunkIdx, codec. The payload follows.
+	ChunkHeaderSize = 1 + 1 + 4 + 4 + 1
 	// EndSize is the whole END message: ver, type, seq, chunkCount, totalLen,
 	// emitEnd, checksum.
 	EndSize = 1 + 1 + 4 + 4 + 8 + 8 + 8
@@ -60,6 +72,11 @@ const (
 	// default-configured ends always interoperate whatever the server's flag.
 	MinChunkSize = 4 << 10
 	MaxChunkSize = 8 << 20
+
+	// CodecRaw payloads are the ledger's bytes verbatim; CodecZstd payloads
+	// are one independent zstd frame each.
+	CodecRaw  byte = 0x00
+	CodecZstd byte = 0x01
 
 	// DefaultMaxPayloadSize is the per-LEDGER cap — the assembly-buffer
 	// ceiling on both ends. It matches the SDK captive-core frame cap
@@ -82,6 +99,7 @@ const (
 var (
 	ErrShortMessage = errors.New("wire: message shorter than header")
 	ErrVersion      = errors.New("wire: unsupported protocol version")
+	ErrCodec        = errors.New("wire: unknown chunk codec")
 	ErrType         = errors.New("wire: unknown message type")
 )
 
@@ -113,21 +131,30 @@ func AppendBegin(dst []byte, seq uint32, emitStartUnixNano int64) []byte {
 // AppendChunk appends a CHUNK message to dst and returns the extended slice.
 // The payload is copied, so a caller may reuse its buffer; a caller that holds
 // on to the result may keep the payload alive by slicing it at ChunkHeaderSize.
-func AppendChunk(dst []byte, seq uint32, chunkIdx uint32, payload []byte) []byte {
+func AppendChunk(dst []byte, seq uint32, chunkIdx uint32, codec byte, payload []byte) []byte {
+	dst = AppendChunkHeader(dst, seq, chunkIdx, codec)
+	return append(dst, payload...)
+}
+
+// AppendChunkHeader appends a CHUNK message's fixed prefix to dst. It exists
+// for the compressing path, which encodes the payload straight onto the
+// returned slice instead of copying an already-built payload in.
+func AppendChunkHeader(dst []byte, seq uint32, chunkIdx uint32, codec byte) []byte {
 	dst = append(dst, Version, TypeChunk)
 	dst = binary.BigEndian.AppendUint32(dst, seq)
 	dst = binary.BigEndian.AppendUint32(dst, chunkIdx)
-	return append(dst, payload...)
+	return append(dst, codec)
 }
 
 // PutChunkHeader writes a CHUNK message's fixed prefix into msg's first
 // ChunkHeaderSize bytes. It exists for the hot path that reads a chunk's
 // payload directly into the message allocation and frames it in place,
 // instead of copying the payload in behind an appended header.
-func PutChunkHeader(msg []byte, seq uint32, chunkIdx uint32) {
+func PutChunkHeader(msg []byte, seq uint32, chunkIdx uint32, codec byte) {
 	msg[0], msg[1] = Version, TypeChunk
 	binary.BigEndian.PutUint32(msg[2:6], seq)
 	binary.BigEndian.PutUint32(msg[6:10], chunkIdx)
+	msg[10] = codec
 }
 
 // AppendEnd appends an END message to dst and returns the extended slice.
@@ -164,6 +191,7 @@ type Message struct {
 
 	// CHUNK
 	ChunkIndex uint32
+	Codec      byte   // CodecRaw or CodecZstd; how Payload is encoded
 	Payload    []byte // aliases the decoded message, living exactly as long
 
 	// END
@@ -195,6 +223,10 @@ func Decode(msg []byte) (Message, error) {
 			return Message{}, fmt.Errorf("%w: CHUNK is %d bytes, want at least %d", ErrShortMessage, len(msg), ChunkHeaderSize)
 		}
 		m.ChunkIndex = binary.BigEndian.Uint32(msg[6:10])
+		m.Codec = msg[10]
+		if m.Codec != CodecRaw && m.Codec != CodecZstd {
+			return Message{}, fmt.Errorf("%w: 0x%02x", ErrCodec, m.Codec)
+		}
 		m.Payload = msg[ChunkHeaderSize:]
 	case TypeEnd:
 		if len(msg) != EndSize {

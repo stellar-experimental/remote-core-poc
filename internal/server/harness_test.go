@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
+
 	"github.com/stellar-experimental/remote-core-poc/internal/store"
 )
 
@@ -22,6 +24,11 @@ type harnessOpts struct {
 	emitWindow time.Duration // 0 = each ledger's bytes all at once
 	chunkSize  int           // 0 = the protocol default
 	retention  int
+	compress   bool
+	// dumpDir replaces the synthetic source with a file replay, which is the
+	// only way to get COMPRESSIBLE ledgers: synthetic payloads are PCG output
+	// and never shrink.
+	dumpDir string
 }
 
 // harness is a running server: a real HTTP listener on 127.0.0.1 with the source
@@ -56,9 +63,18 @@ func startHarness(t *testing.T, opts harnessOpts) *harness {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
+	var source ledgerbackend.LedgerStream = NewSyntheticStream(SyntheticConfig{Size: opts.size})
+	if opts.dumpDir != "" {
+		fs, ferr := NewFileStream(opts.dumpDir)
+		if ferr != nil {
+			t.Fatalf("NewFileStream: %v", ferr)
+		}
+		source = fs
+	}
 	srv, err := New(Config{
-		Source:    PacedSource(NewSyntheticStream(SyntheticConfig{Size: opts.size}), opts.emitWindow, opts.interval),
+		Source:    PacedSource(source, opts.emitWindow, opts.interval),
 		ChunkSize: opts.chunkSize,
+		Compress:  opts.compress,
 		Range:     CountedRange(opts.start, opts.count),
 		Store:     ring,
 		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),

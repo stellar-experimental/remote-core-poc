@@ -202,7 +202,7 @@ func TestBroadcasterConcurrentWatchers(t *testing.T) {
 	for seq := uint32(1); seq <= flows; seq++ {
 		b.begin(seq, wire.AppendBegin(nil, seq, 1))
 		for i := range 3 {
-			b.chunk(wire.AppendChunk(nil, seq, uint32(i), fmt.Appendf(nil, "%d/%d", seq, i)))
+			b.chunk(wire.AppendChunk(nil, seq, uint32(i), wire.CodecRaw, fmt.Appendf(nil, "%d/%d", seq, i)))
 		}
 		b.end(wire.AppendEnd(nil, seq, 3, 0, int64(seq), 0))
 	}

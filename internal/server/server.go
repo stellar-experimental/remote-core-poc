@@ -32,6 +32,7 @@ import (
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/coder/websocket"
+	"github.com/klauspost/compress/zstd"
 	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
 
 	"github.com/stellar-experimental/remote-core-poc/internal/store"
@@ -68,6 +69,17 @@ type Config struct {
 	// Zero means wire.DefaultChunkSize.
 	ChunkSize int
 
+	// Compress makes every chunk ship zstd-compressed when that shrinks it.
+	// Real meta compresses ~7.5x per chunk, which is what lets a ledger's
+	// transfer finish inside the source's emission window on one TCP flow —
+	// see compress.go. Off ships CodecRaw chunks; the wire format is the same
+	// either way, so a client needs no configuration.
+	Compress bool
+
+	// CompressWorkers is how many chunks compress concurrently. Zero means
+	// compressWorkersDefault. Validated whether or not Compress is set.
+	CompressWorkers int
+
 	// Range is what Run asks the source for. Its start must be a concrete
 	// ledger: the server counts sequences from it.
 	Range ledgerbackend.Range
@@ -87,6 +99,15 @@ type Server struct {
 	b         *broadcaster
 	log       *slog.Logger
 	chunkSize int
+
+	// enc is the LIVE pipeline's encoder and ringEnc the retention ring's.
+	// They are separate pools on purpose: zstd.Encoder gates a fixed set of
+	// encoder states, so one shared pool let a catch-up subscriber throttle
+	// the source loop (see newEncoder). Both nil when not compressing.
+	enc             *zstd.Encoder
+	ringEnc         *zstd.Encoder
+	compressWorkers int
+	rawFallbacks    atomic.Uint64
 
 	published    atomic.Uint64
 	subscribers  atomic.Int64
@@ -122,6 +143,23 @@ func New(cfg Config) (*Server, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	workers, err := validateCompressWorkers(cfg.CompressWorkers)
+	if err != nil {
+		return nil, fmt.Errorf("server: %w", err)
+	}
+	var enc, ringEnc *zstd.Encoder
+	if cfg.Compress {
+		// Built here rather than in Run so a bad configuration fails before
+		// the listener binds, not after the daemon reports itself up. The
+		// ring gets its own encoder: see newEncoder on why sharing one lets a
+		// subscriber throttle the source loop.
+		if enc, err = newEncoder(workers, chunkSize); err != nil {
+			return nil, fmt.Errorf("server: compression: %w", err)
+		}
+		if ringEnc, err = newEncoder(ringEncoderConcurrency, chunkSize); err != nil {
+			return nil, fmt.Errorf("server: compression: %w", err)
+		}
+	}
 	return &Server{
 		source:    cfg.Source,
 		rng:       cfg.Range,
@@ -129,11 +167,20 @@ func New(cfg Config) (*Server, error) {
 		b:         newBroadcaster(),
 		log:       logger,
 		chunkSize: chunkSize,
+
+		enc:             enc,
+		ringEnc:         ringEnc,
+		compressWorkers: workers,
 	}, nil
 }
 
 // Subscribers is how many consumers are currently connected.
 func (s *Server) Subscribers() int { return int(s.subscribers.Load()) }
+
+// RawFallbacks is how many live chunks shipped uncompressed because every
+// encoder was busy. Non-zero means compression is silently degrading: the
+// codec is per chunk, so nothing else in the numbers moves when it happens.
+func (s *Server) RawFallbacks() uint64 { return s.rawFallbacks.Load() }
 
 // LiveAbandons is how many times a slow subscriber's live chunk flow was
 // abandoned in favour of a ring redelivery. A measurement window must show
@@ -169,6 +216,18 @@ func (s *Server) Run(ctx context.Context) (err error) {
 	defer func() { s.b.finish(err) }()
 
 	s.log.Info("source loop starting", "range", s.rng.String(), "chunk_size", s.chunkSize)
+
+	// One pipeline for the whole run. A per-ledger pipeline would churn five
+	// goroutines every 600 ms, and — the reason this is not merely
+	// wasteful — every early return below would leak its publisher,
+	// which then publishes into a broadcaster this function has already
+	// finished, panicking the daemon on an ordinary shutdown.
+	// s.enc is nil when not compressing, which makes this a pass-through that
+	// frames and publishes inline — so the source loop has one path either
+	// way. Routing the uncompressed case through it costs 166 ns per ledger,
+	// five orders of magnitude below what the A/B can resolve.
+	pipeline := newChunkPipeline(s.enc, s.compressWorkers, s.chunkSize, &s.rawFallbacks, s.b.chunk)
+	defer pipeline.close()
 
 	var prevSeq uint32  // the last emitted sequence; the chain must be dense
 	var assembly []byte // reused across ledgers; the store copies it to disk
@@ -212,7 +271,8 @@ func (s *Server) Run(ctx context.Context) (err error) {
 		}
 		hasher.Reset()
 
-		// arena holds every chunk message of this ledger in one allocation.
+		// arena holds this ledger's raw chunk reads in one allocation — and,
+		// when not compressing, the published messages themselves.
 		// Published messages are immutable and the broadcaster pins the whole
 		// flow until the next BEGIN anyway, so a per-ledger arena preserves
 		// both while collapsing ~58 per-chunk allocations per stress ledger —
@@ -257,18 +317,19 @@ func (s *Server) Run(ctx context.Context) (err error) {
 						seq, maxPayloadSize)
 				}
 				msg := buf[:wire.ChunkHeaderSize+n]
-				wire.PutChunkHeader(msg, seq, chunkIdx)
-				// Publish before hashing and assembling: the wire is the
-				// deadline, and both bookkeeping passes only read the message,
-				// so subscribers may share it already.
-				s.b.chunk(msg)
+				data := msg[wire.ChunkHeaderSize:]
+				// Hand the chunk on before hashing and assembling: the wire is
+				// the deadline, and both bookkeeping passes only READ these
+				// bytes, so they may already be on their way out. The pipeline
+				// reads msg until it drains, which the arena's disjoint
+				// regions keep valid and flush() enforces before END.
+				pipeline.submit(seq, chunkIdx, msg)
 				chunkIdx++
 				if fromArena {
 					used += wire.ChunkHeaderSize + n
 				} else {
 					spare = nil
 				}
-				data := msg[wire.ChunkHeaderSize:]
 				_, _ = hasher.Write(data) // xxhash's Write cannot fail
 				assembly = append(assembly, data...)
 			}
@@ -283,6 +344,9 @@ func (s *Server) Run(ctx context.Context) (err error) {
 				return fmt.Errorf("source failed emitting ledger %d: %w", seq, rerr)
 			}
 		}
+		// Every chunk is published, in order, before END announces the counts
+		// and checksum they must match.
+		pipeline.flush()
 		// A source that declared a size must deliver exactly it: publishing a
 		// truncated body under a fresh checksum would turn a mid-frame source
 		// failure into a valid-looking shorter ledger.
@@ -675,7 +739,7 @@ func (s *Server) writeRingFlow(
 	var idx uint32
 	for off := 0; off < len(raw); off += s.chunkSize {
 		chunk := raw[off:min(off+s.chunkSize, len(raw))]
-		b = wire.AppendChunk(b[:0], seq, idx, chunk)
+		b = encodeChunk(s.ringEnc, b, seq, idx, chunk)
 		if err := s.write(ctx, conn, b); err != nil {
 			return err
 		}
@@ -697,6 +761,10 @@ type health struct {
 	Latest       uint32 `json:"latest"`
 	Subscribers  int    `json:"subscribers"`
 	LiveAbandons uint64 `json:"live_abandons"`
+	// RawFallbacks is live chunks shipped uncompressed because every encoder
+	// was busy. Non-zero means compression is silently degrading — the wire
+	// cost of a ledger rises without anything else changing.
+	RawFallbacks uint64 `json:"raw_fallbacks"`
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -707,6 +775,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		Latest:       latest,
 		Subscribers:  s.Subscribers(),
 		LiveAbandons: s.LiveAbandons(),
+		RawFallbacks: s.RawFallbacks(),
 	}); err != nil {
 		s.log.Debug("healthz write failed", "error", err)
 	}
