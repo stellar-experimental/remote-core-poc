@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stellar/go-stellar-sdk/xdr"
 )
@@ -232,4 +233,41 @@ func TestPipeSource_TruncatedFrameSurfaces(t *testing.T) {
 		return
 	}
 	t.Fatal("no emission yielded")
+}
+
+// TestPipeSource_CancelUnblocksAnEscapedWriter pins the shutdown contract
+// against the case that actually happened: a grandchild that escapes the
+// process group keeps the pipe's write end open, so the read never EOFs. The
+// source must still return when the context is cancelled — before this was
+// fixed it did not, and the daemon stayed alive with its listener already
+// shut down and a stellar-core spinning behind it for two days.
+func TestPipeSource_CancelUnblocksAnEscapedWriter(t *testing.T) {
+	// setsid puts the sleeper in its own session, so the source's group
+	// SIGTERM cannot reach it; it inherits fd 3 and holds the pipe open. The
+	// parent shell exits immediately, so the child is gone while the writer
+	// is not — exactly the observed shape.
+	src := PipeSource("setsid sleep 60 & exit 0")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range src.Emissions(ctx, CountedRange(1, 0)) { //nolint:revive // draining is the point
+		}
+	}()
+
+	// The read is blocked on a pipe nothing will ever write to or close.
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case <-done:
+		t.Fatal("the source ended before the cancel: the fixture is not holding the pipe open")
+	default:
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("cancel did not unblock the pipe read: the source outlived its context")
+	}
 }
