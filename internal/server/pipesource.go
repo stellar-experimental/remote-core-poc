@@ -34,13 +34,23 @@ import (
 // decodes the rest. The range
 // argument is informational: sequences come from the metas themselves, and
 // the stream ends at pipe EOF (the child exiting cleanly ends the range).
-func PipeSource(command string) EmittingStream {
-	return &pipeStream{command: command}
+func PipeSource(command string, pipeBytes int) EmittingStream {
+	return &pipeStream{command: command, pipeBytes: pipeBytes}
 }
 
 type pipeStream struct {
 	command string
+	// pipeBytes is the kernel pipe capacity to ask for. It bounds what one
+	// read can return, and the source frames one chunk per read, so it is
+	// really the chunk-size knob for this source. Zero keeps the default.
+	pipeBytes int
 }
+
+// DefaultPipeBytes is the capacity PipeSource asks for when the caller does
+// not choose. It is above the 256 KiB default chunk size so one read can fill
+// a whole chunk with room over, and at or under the usual
+// /proc/sys/fs/pipe-max-size of 1 MiB so an unprivileged daemon gets it.
+const DefaultPipeBytes = 1 << 20
 
 // seqPrefixLen is how much of each meta is buffered before streaming the
 // rest: enough for the view's walk to reach LedgerHeader.ledgerSeq, which
@@ -58,6 +68,18 @@ func (p *pipeStream) Emissions(ctx context.Context, _ ledgerbackend.Range) iter.
 			return
 		}
 		defer r.Close()
+		// Sizing the pipe before the child inherits the write end: capacity
+		// belongs to the pipe, not to an end, so this governs how much core
+		// can hand over per read — and therefore how large a chunk gets. A
+		// refusal (EPERM past pipe-max-size) is not fatal; the default
+		// capacity still works, just in smaller pieces.
+		want := p.pipeBytes
+		if want == 0 {
+			want = DefaultPipeBytes
+		}
+		if _, err := setPipeSize(r, want); err != nil {
+			_ = err // best effort: the granted capacity is whatever it is
+		}
 
 		cmd := exec.CommandContext(ctx, "sh", "-c", p.command)
 		cmd.Stdout = os.Stdout

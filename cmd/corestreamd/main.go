@@ -57,6 +57,7 @@ type options struct {
 	listen      string
 	source      string
 	retention   int
+	pipeBytes   int
 	startLedger uint
 	dataDir     string
 	logLevel    string
@@ -92,6 +93,8 @@ func parseFlags(out io.Writer, args []string) (options, error) {
 	fs.StringVar(&o.source, "source", "synthetic", "ledger source: captive|file|synthetic|pipe")
 	fs.IntVar(&o.retention, "retention", 10_000, "ledgers to keep on disk for replay")
 	fs.UintVar(&o.startLedger, "start-ledger", 0, "first ledger to stream (required for captive; defaults to 1 otherwise)")
+	fs.IntVar(&o.pipeBytes, "pipe-size", server.DefaultPipeBytes,
+		"kernel pipe capacity for -source pipe, in bytes; bounds how much one read returns and so how large a chunk gets")
 	fs.StringVar(&o.dataDir, "data-dir", "corestreamd-data", "directory for the retention ring")
 	fs.StringVar(&o.logLevel, "log-level", "info", "log level: debug|info|warn|error")
 
@@ -306,7 +309,7 @@ func run() error {
 		// The pipe IS the pacer: frames stream as the child writes them, so
 		// no PacedSource — this is the below-the-seam tap the captive case's
 		// comment defers to, with sequences parsed from the metas themselves.
-		source = server.PipeSource(o.pipeCmd)
+		source = server.PipeSource(o.pipeCmd, o.pipeBytes)
 		rng = ledgerbackend.UnboundedRange(start)
 	case "captive":
 		storageDir := o.storageDir

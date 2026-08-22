@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/stellar/go-stellar-sdk/xdr"
+
+	"github.com/stellar-experimental/remote-core-poc/internal/wire"
 )
 
 // metaFixture marshals a LedgerCloseMeta with the SDK — the byte-level
@@ -159,7 +161,7 @@ func TestPipeSource_StreamsFramedMetas(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	src := PipeSource(fmt.Sprintf("cat %s >&3", path))
+	src := PipeSource(fmt.Sprintf("cat %s >&3", path), 0)
 	var got []uint32
 	for em, err := range src.Emissions(context.Background(), CountedRange(1, 0)) {
 		if err != nil {
@@ -191,7 +193,7 @@ func TestPipeSource_StreamsFramedMetas(t *testing.T) {
 // TestPipeSource_ChildFailureSurfaces pins the loud-exit contract: a child
 // that dies mid-stream must surface an error, not a silent clean end.
 func TestPipeSource_ChildFailureSurfaces(t *testing.T) {
-	src := PipeSource("exit 7")
+	src := PipeSource("exit 7", 0)
 	var sawErr bool
 	for _, err := range src.Emissions(context.Background(), CountedRange(1, 0)) {
 		if err != nil {
@@ -221,7 +223,7 @@ func TestPipeSource_TruncatedFrameSurfaces(t *testing.T) {
 	if err := os.WriteFile(path, stream, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	src := PipeSource(fmt.Sprintf("cat %s >&3", path))
+	src := PipeSource(fmt.Sprintf("cat %s >&3", path), 0)
 	for em, err := range src.Emissions(context.Background(), CountedRange(1, 0)) {
 		if err != nil {
 			t.Fatalf("emission-level error before body read: %v", err)
@@ -246,7 +248,7 @@ func TestPipeSource_CancelUnblocksAnEscapedWriter(t *testing.T) {
 	// SIGTERM cannot reach it; it inherits fd 3 and holds the pipe open. The
 	// parent shell exits immediately, so the child is gone while the writer
 	// is not — exactly the observed shape.
-	src := PipeSource("setsid sleep 60 & exit 0")
+	src := PipeSource("setsid sleep 60 & exit 0", 0)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -270,4 +272,34 @@ func TestPipeSource_CancelUnblocksAnEscapedWriter(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("cancel did not unblock the pipe read: the source outlived its context")
 	}
+}
+
+// TestSetPipeSize pins the mechanism the chunk size depends on for this
+// source. A read cannot return more than the pipe holds, and the source frames
+// one chunk per read, so the default 64 KiB capacity silently caps chunks at a
+// quarter of the configured size no matter what -chunk-size says.
+func TestSetPipeSize(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+
+	before, err := setPipeSize(r, 0)
+	if err != nil {
+		t.Skipf("pipe sizing unavailable here: %v", err)
+	}
+	got, err := setPipeSize(r, DefaultPipeBytes)
+	if err != nil {
+		t.Skipf("kernel refused %d bytes (pipe-max-size?): %v", DefaultPipeBytes, err)
+	}
+	if got < wire.DefaultChunkSize {
+		t.Fatalf("pipe capacity %d is under one chunk (%d): reads cannot fill a chunk",
+			got, wire.DefaultChunkSize)
+	}
+	if got <= before {
+		t.Fatalf("capacity did not grow: %d -> %d", before, got)
+	}
+	t.Logf("pipe capacity %d -> %d bytes", before, got)
 }
