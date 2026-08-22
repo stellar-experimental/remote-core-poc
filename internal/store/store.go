@@ -122,7 +122,19 @@ func ScanLedgerDir(dir string) ([]uint32, error) {
 // Sequence 0 is rejected: stellar ledger sequences start at 1, so a 0 here means
 // a counter ran past math.MaxUint32 and wrapped. The protocol has no room for a
 // wrap, and accepting it would let a wrapped ring look contiguous.
+// PutParts retains a ledger held as consecutive pieces, without asking the
+// caller to join them first. The relay already has every byte in its chunk
+// arena, so a contiguous copy exists only to satisfy Put — 14.48 MiB of
+// memcpy per stress ledger, on the goroutine that is draining core's pipe.
+func (s *Store) PutParts(seq uint32, parts [][]byte) (reset bool, err error) {
+	return s.put(seq, parts)
+}
+
 func (s *Store) Put(seq uint32, raw []byte) (reset bool, err error) {
+	return s.put(seq, [][]byte{raw})
+}
+
+func (s *Store) put(seq uint32, parts [][]byte) (reset bool, err error) {
 	if seq == 0 {
 		return false, fmt.Errorf("%w: ledger sequences start at 1, so 0 means a wrapped counter", ErrInvalidSequence)
 	}
@@ -136,7 +148,7 @@ func (s *Store) Put(seq uint32, raw []byte) (reset bool, err error) {
 		}
 		reset = true
 	}
-	if err := s.write(seq, raw); err != nil {
+	if err := s.write(seq, parts); err != nil {
 		return reset, err
 	}
 	if s.filled {
@@ -151,12 +163,23 @@ func (s *Store) Put(seq uint32, raw []byte) (reset bool, err error) {
 }
 
 // write puts the bytes on disk via a temporary file, so a reader never observes
-// a half-written ledger under its final name.
-func (s *Store) write(seq uint32, raw []byte) error {
+// a half-written ledger under its final name. Parts are written in order and
+// land contiguously, so what Get reads back is identical either way.
+func (s *Store) write(seq uint32, parts [][]byte) error {
 	final := s.path(seq)
 	tmp := final + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
 		return fmt.Errorf("store: write ledger %d: %w", seq, err)
+	}
+	for _, part := range parts {
+		if _, werr := f.Write(part); werr != nil {
+			f.Close()
+			return fmt.Errorf("store: write ledger %d: %w", seq, werr)
+		}
+	}
+	if cerr := f.Close(); cerr != nil {
+		return fmt.Errorf("store: write ledger %d: %w", seq, cerr)
 	}
 	if err := os.Rename(tmp, final); err != nil {
 		return fmt.Errorf("store: publish ledger %d: %w", seq, err)

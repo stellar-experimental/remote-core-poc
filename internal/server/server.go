@@ -229,13 +229,17 @@ func (s *Server) Run(ctx context.Context) (err error) {
 	pipeline := newChunkPipeline(s.enc, s.compressWorkers, s.chunkSize, &s.rawFallbacks, s.b.chunk)
 	defer pipeline.close()
 
-	var prevSeq uint32  // the last emitted sequence; the chain must be dense
-	var assembly []byte // reused across ledgers; the store copies it to disk
+	var prevSeq uint32 // the last emitted sequence; the chain must be dense
+	// parts are this ledger's chunk payloads, in order, borrowed from the
+	// arena below. They are what the store retains, so the ledger never needs
+	// joining into a second full-size buffer.
+	var parts [][]byte
 	// spare is a fallback CHUNK message allocation for ledgers whose size the
 	// source did not declare. Once published it belongs to subscribers and a
 	// fresh one is allocated; a read that returns no data hands it back.
 	var spare []byte
-	hasher := xxhash.New()
+	hasher := newLedgerHasher()
+	defer hasher.close()
 
 	for em, err := range s.source.Emissions(ctx, s.rng) {
 		if err != nil {
@@ -265,11 +269,8 @@ func (s *Server) Run(ctx context.Context) (err error) {
 				seq, em.Size, maxPayloadSize)
 		}
 
-		assembly = assembly[:0]
-		if int64(cap(assembly)) < em.Size {
-			assembly = make([]byte, 0, em.Size)
-		}
-		hasher.Reset()
+		parts = parts[:0]
+		var total int64
 
 		// arena holds this ledger's raw chunk reads in one allocation — and,
 		// when not compressing, the published messages themselves.
@@ -310,9 +311,9 @@ func (s *Server) Run(ctx context.Context) (err error) {
 				}
 				buf = spare
 			}
-			n, rerr := em.Body.Read(buf[wire.ChunkHeaderSize:])
+			n, rerr := fillChunk(em.Body, buf[wire.ChunkHeaderSize:])
 			if n > 0 {
-				if int64(len(assembly))+int64(n) > maxPayloadSize {
+				if total+int64(n) > maxPayloadSize {
 					return fmt.Errorf("ledger %d ran past the %d-byte protocol payload cap mid-emission",
 						seq, maxPayloadSize)
 				}
@@ -330,8 +331,12 @@ func (s *Server) Run(ctx context.Context) (err error) {
 				} else {
 					spare = nil
 				}
-				_, _ = hasher.Write(data) // xxhash's Write cannot fail
-				assembly = append(assembly, data...)
+				// Both of these only READ data, and both finish before the
+				// arena region is reused: flush() drains the pipeline and
+				// sum() fences the hasher, each before the next ledger.
+				hasher.write(data)
+				parts = append(parts, data)
+				total += int64(n)
 			}
 			if rerr == io.EOF {
 				break
@@ -350,14 +355,14 @@ func (s *Server) Run(ctx context.Context) (err error) {
 		// A source that declared a size must deliver exactly it: publishing a
 		// truncated body under a fresh checksum would turn a mid-frame source
 		// failure into a valid-looking shorter ledger.
-		if em.Size > 0 && int64(len(assembly)) != em.Size {
+		if em.Size > 0 && total != em.Size {
 			return fmt.Errorf("ledger %d body is %d bytes, source declared %d",
-				seq, len(assembly), em.Size)
+				seq, total, em.Size)
 		}
 		s.b.end(wire.AppendEnd(make([]byte, 0, wire.EndSize), seq, chunkIdx,
-			uint64(len(assembly)), time.Now().UnixNano(), hasher.Sum64()))
+			uint64(total), time.Now().UnixNano(), hasher.sum()))
 
-		reset, err := s.store.Put(seq, assembly)
+		reset, err := s.store.PutParts(seq, parts)
 		if err != nil {
 			return fmt.Errorf("retain ledger %d: %w", seq, err)
 		}
@@ -368,7 +373,7 @@ func (s *Server) Run(ctx context.Context) (err error) {
 		s.published.Add(1)
 		if seq%100 == 0 {
 			oldest, latest, _ := s.store.Bounds()
-			s.log.Info("streaming", "ledger", seq, "bytes", len(assembly), "chunks", chunkIdx,
+			s.log.Info("streaming", "ledger", seq, "bytes", total, "chunks", chunkIdx,
 				"retained_oldest", oldest, "retained_latest", latest, "subscribers", s.Subscribers())
 		}
 	}
