@@ -19,6 +19,10 @@ type sample struct {
 	// sinceStart is the offset from the first ledger of the run, which is what
 	// inter-arrival gaps are computed from. It is filled in by add.
 	sinceStart time.Duration
+	// arrivedUnixNano is when this ledger became usable, on the wall clock.
+	// Relative offsets cannot be compared across processes; this can, which
+	// is what lets two consumers of ONE core run be subtracted per ledger.
+	arrivedUnixNano int64
 	// delivery is assembled-and-verified minus the server's emit-end stamp:
 	// the headline metric, how long after the source finished the ledger was
 	// usable. Absent for a locally consumed ledger and for one replayed from
@@ -57,6 +61,7 @@ func (c *collector) add(now time.Time, s sample) {
 		c.start = now
 	}
 	s.sinceStart = now.Sub(c.start)
+	s.arrivedUnixNano = now.UnixNano()
 	c.samples = append(c.samples, s)
 	c.bytes += int64(s.bytes)
 }
@@ -210,6 +215,7 @@ func (c *collector) writeCSV(w io.Writer) error {
 	header := []string{
 		"sequence", "bytes", "chunks", "since_start_ns", "inter_arrival_ns",
 		"emit_ns", "delivery_ns", "pipeline_ns", "discarded_partials",
+		"arrived_unix_ns",
 	}
 	if err := cw.Write(header); err != nil {
 		return err
@@ -235,6 +241,7 @@ func (c *collector) writeCSV(w io.Writer) error {
 			optional(s.delivery, s.hasDelivery),
 			optional(s.pipeline, s.hasPipeline),
 			strconv.Itoa(s.discarded),
+			strconv.FormatInt(s.arrivedUnixNano, 10),
 		}
 		if err := cw.Write(row); err != nil {
 			return err

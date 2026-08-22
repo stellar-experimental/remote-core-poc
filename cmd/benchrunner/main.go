@@ -65,6 +65,7 @@ type options struct {
 
 	pipeCmd   string
 	pipeBytes int
+	pipeFifo  string
 
 	coreBinary        string
 	coreConfig        string
@@ -104,6 +105,9 @@ func parseFlags(out io.Writer, args []string) (options, error) {
 		"localtap: command whose fd 3 carries framed LedgerCloseMeta")
 	fs.IntVar(&o.pipeBytes, "pipe-size", server.DefaultPipeBytes,
 		"localtap: kernel pipe capacity in bytes")
+	fs.StringVar(&o.pipeFifo, "pipe-fifo", "",
+		"localtap: read framed metas from this FIFO instead of spawning a command "+
+			"(pairs a second consumer onto a core someone else is running)")
 
 	fs.StringVar(&o.coreBinary, "core-binary", "", "local: stellar-core binary (default: found on PATH)")
 	fs.StringVar(&o.coreConfig, "core-config", "", "local: captive-core toml path")
@@ -142,8 +146,8 @@ func parseFlags(out io.Writer, args []string) (options, error) {
 		}
 	case "remote":
 	case "localtap":
-		if o.pipeCmd == "" {
-			return o, errors.New("--pipe-cmd is required in localtap mode")
+		if o.pipeCmd == "" && o.pipeFifo == "" {
+			return o, errors.New("localtap needs --pipe-cmd or --pipe-fifo")
 		}
 	case "local":
 		if o.start == 0 {
@@ -401,8 +405,15 @@ func runLocal(ctx context.Context, o options) (*collector, error) {
 // emission window, not against zero, and running both through one reader
 // keeps the pipe-size question honest on both sides.
 func runLocalTap(ctx context.Context, o options) (*collector, error) {
-	src := server.PipeSource(o.pipeCmd, o.pipeBytes)
-	c := newCollector("local tap (core's pipe, no network)")
+	var src server.EmittingStream
+	label := "local tap (core's pipe, no network)"
+	if o.pipeFifo != "" {
+		src = server.FifoSource(o.pipeFifo, o.pipeBytes)
+		label = "local tap (mirrored meta FIFO, no network)"
+	} else {
+		src = server.PipeSource(o.pipeCmd, o.pipeBytes)
+	}
+	c := newCollector(label)
 	var assembly []byte
 	buf := make([]byte, o.chunkSize)
 	for em, err := range src.Emissions(ctx, rangeFrom(o)) {
