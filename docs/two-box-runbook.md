@@ -72,6 +72,15 @@ stream ends when core exits. Expected ≈ P1 at n=100 (single-box read: p50
 2.19 ms; the real wire should land at or under it). Run it with
 `-compress=false` too for the paired uncompressed row (17.94 ms p50).
 
+**What P2 does NOT cover.** The target shape is 600 ms close time at sac6000
+density, and P2 does not run at it: apply-load produces a ledger every ~2 s on
+this hardware, 3.3x slower than the target, so P2 proves the tap and the codec
+against real meta at a third of the cadence. Only the synthetic source (P1)
+runs at 600 ms. So the transport is measured at the target shape and real core
+meta is measured at core's natural pace — the two have never been measured
+together, and cannot be until core closes sac6000 ledgers at 600 ms. Read a
+P2 pass as "the tap is honest", not as "the target shape is proven".
+
 **Cell P3 (optional) — today's network shape.**
 Server: `-source pipe -pipe-cmd "stellar-core catchup <recent>/<count>
 --metadata-output-stream fd:3"` on a pubnet config. Real pubnet metas are
@@ -101,3 +110,22 @@ measured against.
   penalty is the unhidden wire ≈ 2.2 ms + tail).
 - If P1 exceeds ~5.5 ms: something outside the model (irq steering, placement,
   clock) — check `chronyc tracking`, `ethtool -S` coalescing, and rerun.
+- Capture `ethtool -S` allowance counters (`bw_in_allowance_exceeded`,
+  `pps_allowance_exceeded`, `conntrack_allowance_exceeded`) and `ss -ti`
+  retransmits on the ledger socket alongside the percentiles. CloudWatch
+  cannot substitute: AWS documents that these counters can show dropped
+  packets while the instance metrics show nothing, because the averaging
+  window is far coarser than a microburst — and at 600 ms the stream IS a
+  microburst, on the wire 0.53% of the time.
+
+## Sizing at the target shape
+
+600 ms close time at sac6000 density is 14.48 MiB of meta every 600 ms:
+202 Mbit/s raw, 26.7 Mbit/s compressed, 2.19 TB/day of meta. Two consequences
+worth setting before a long run, neither of them about the wire:
+
+- **The ring stores raw**, so `-retention 10000` is ~141 GiB and covers only
+  100 minutes at this cadence. Size it in wall-clock: six hours is ~509 GiB
+  and 36,000 ledgers, plus ~25 MB/s of sustained ring writes.
+- **The subscriber must absorb ~85 GiB/hour** of meta, continuously. That is a
+  much tighter constraint than anything measured here.

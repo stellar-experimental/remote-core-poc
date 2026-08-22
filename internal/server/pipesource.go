@@ -80,6 +80,20 @@ func (p *pipeStream) Emissions(ctx context.Context, _ ledgerbackend.Range) iter.
 		}
 		// The parent must not hold the write end open, or EOF never arrives.
 		w.Close()
+		// Nor may a blocked read outlive the context. Everything below assumes
+		// the pipe eventually EOFs, which assumes every writer eventually
+		// exits — and a grandchild that escaped the process group does not:
+		// it keeps the write end open and this read never returns, so the
+		// defer that would close r is unreachable, Run never returns, and the
+		// daemon lives on with its listener already shut. That is not
+		// hypothetical; it left a corestreamd running for two days after an
+		// ordinary SIGTERM, its stellar-core spinning at 100% of a core.
+		// os.Pipe is poller-backed, so a deadline in the past unblocks the
+		// read at once.
+		stopUnblock := context.AfterFunc(ctx, func() {
+			_ = r.SetReadDeadline(time.Now())
+		})
+		defer stopUnblock()
 		// The child is killed by CommandContext on ctx cancel; reap it
 		// exactly once on every exit path so a yield-stop cannot leak a
 		// zombie and no path ever sees a second Wait's spurious error.
@@ -99,13 +113,25 @@ func (p *pipeStream) Emissions(ctx context.Context, _ ledgerbackend.Range) iter.
 		// r.Close is then a harmless double-close.
 		defer func() {
 			_ = r.Close()
-			if cmd.Process != nil && ctx.Err() == nil {
+			if cmd.Process == nil {
+				_ = wait()
+				return
+			}
+			if ctx.Err() == nil {
 				// An early stop with the context still live gets no Cancel
 				// from CommandContext; tear the group down ourselves so no
 				// grandchild survives holding the pipe.
 				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 			}
 			_ = wait()
+			// Whatever is still in the group outlived both the SIGTERM and
+			// the child that led it. WaitDelay only escalates to the direct
+			// child, so a grandchild ignoring SIGTERM — an apply-load mid-run
+			// does exactly this — is left running with nothing to write to.
+			// The group exists solely for this command, so sweeping it is
+			// safe; on the ordinary path it is already empty and this is an
+			// ESRCH no-op.
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		}()
 
 		br := bufio.NewReaderSize(r, 1<<20)
@@ -144,7 +170,7 @@ func (p *pipeStream) Emissions(ctx context.Context, _ ledgerbackend.Range) iter.
 				yield(Emission{}, fmt.Errorf("pipe source: read ledger seq: %w", err))
 				return
 			}
-			body := io.MultiReader(bytes.NewReader(prefix[:n]), &frameTail{r: br, remaining: size - n})
+			body := io.MultiReader(bytes.NewReader(prefix[:n]), &frameTail{ctx: ctx, r: br, remaining: size - n})
 			if !yield(Emission{Seq: seq, Size: size, Body: body}, nil) {
 				return
 			}
@@ -156,6 +182,7 @@ func (p *pipeStream) Emissions(ctx context.Context, _ ledgerbackend.Range) iter.
 // EOF before the marker-declared length into a loud ErrUnexpectedEOF — a
 // child dying mid-frame must never read as a clean, shorter ledger.
 type frameTail struct {
+	ctx       context.Context
 	r         *bufio.Reader
 	remaining int64
 }
@@ -169,6 +196,13 @@ func (f *frameTail) Read(p []byte) (int, error) {
 	}
 	n, err := f.r.Read(p)
 	f.remaining -= int64(n)
+	if err != nil && f.ctx.Err() != nil {
+		// A shutdown that interrupts a body read reports the cancellation,
+		// not the read deadline that implemented it: the consumer tells its
+		// own shutdown from a source failure by unwrapping the context error,
+		// and an i/o timeout would be logged as a failed source loop.
+		return n, f.ctx.Err()
+	}
 	if errors.Is(err, io.EOF) && f.remaining > 0 {
 		err = fmt.Errorf("pipe source: frame truncated %d bytes short: %w", f.remaining, io.ErrUnexpectedEOF)
 	}
